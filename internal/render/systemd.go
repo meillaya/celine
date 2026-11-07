@@ -17,6 +17,7 @@ type SystemdOptions struct {
 	StateDir   string
 	BackupDir  string
 	OnCalendar string
+	PathEnv    string
 }
 
 // SystemdUnits renders the host units that start the stack at boot, take a
@@ -32,6 +33,12 @@ func SystemdUnits(opts SystemdOptions) (map[string]string, error) {
 
 	environment := []string{
 		fmt.Sprintf("Environment=HOME=%s", opts.Home),
+	}
+	if opts.PathEnv != "" {
+		// System units do not inherit the operator's shell PATH. Capture it at
+		// render time so secretspec, sops, sqlite3, docker, and tailscale resolve
+		// the same way they did when the units were generated.
+		environment = append(environment, fmt.Sprintf("Environment=PATH=%s", opts.PathEnv))
 	}
 	if opts.DockerHost != "" {
 		environment = append(environment, fmt.Sprintf("Environment=DOCKER_HOST=%s", opts.DockerHost))

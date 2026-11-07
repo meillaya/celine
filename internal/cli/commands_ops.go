@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -392,6 +393,7 @@ func (a App) cmdSystemd(args []string) int {
 	set, common := a.newFlagSet("systemd " + sub)
 	outDir := set.String("out", "", "directory for rendered units")
 	systemDir := set.String("dir", "/etc/systemd/system", "install target directory")
+	celineBin := set.String("celine", "", "binary path to embed in the generated units")
 	if code, done := parseFlags(set, args[1:]); done {
 		return code
 	}
@@ -403,8 +405,15 @@ func (a App) cmdSystemd(args []string) int {
 	if dockerHost == "" && cfg.Runtime.Rootless {
 		dockerHost = fmt.Sprintf("unix:///run/user/%d/podman/podman.sock", a.UID)
 	}
+	bin := a.CelineBin
+	if *celineBin != "" {
+		bin, err = filepath.Abs(*celineBin)
+		if err != nil {
+			return a.fail(err)
+		}
+	}
 	units, err := render.SystemdUnits(render.SystemdOptions{
-		CelineBin:  a.CelineBin,
+		CelineBin:  bin,
 		ConfigPath: cfg.Path,
 		User:       a.Username,
 		Group:      a.Username,
@@ -414,6 +423,7 @@ func (a App) cmdSystemd(args []string) int {
 		StateDir:   cfg.Resolved.StateDir,
 		BackupDir:  cfg.Resolved.BackupDir,
 		OnCalendar: cfg.Backup.OnCalendar,
+		PathEnv:    unitPathEnv(),
 	})
 	if err != nil {
 		return a.fail(err)
@@ -449,4 +459,43 @@ func (a App) cmdSystemd(args []string) int {
 		a.errOut("unknown systemd command %q (use render or install)", sub)
 		return 2
 	}
+}
+
+// unitPathEnv builds a compact PATH for the boot units from the directories
+// that actually provide the runtime tools. A shell PATH is often long and
+// contains transient entries that do not exist after a reboot.
+func unitPathEnv() string {
+	seen := map[string]bool{}
+	dirs := make([]string, 0, 10)
+	add := func(dir string) {
+		if dir == "" || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		add(filepath.Join(home, ".nix-profile", "bin"))
+	}
+	// Prefer stable system/profile directories so the units survive a store
+	// garbage collection or a dev-shell exit.
+	for _, dir := range []string{
+		"/run/current-system/sw/bin",
+		"/run/wrappers/bin",
+		"/run/system-manager/sw/bin",
+		"/usr/local/sbin",
+		"/usr/local/bin",
+		"/usr/sbin",
+		"/usr/bin",
+		"/sbin",
+		"/bin",
+	} {
+		add(dir)
+	}
+	for _, name := range []string{"docker", "tailscale", "secretspec", "sops", "sqlite3"} {
+		if path, err := exec.LookPath(name); err == nil {
+			add(filepath.Dir(path))
+		}
+	}
+	return strings.Join(dirs, ":")
 }

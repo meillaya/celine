@@ -22,7 +22,8 @@ Rules and orientation for agents changing the Celine repository. The user-facing
 | `nix/package.nix`, `nix/module.nix`, `flake.nix` | Package, NixOS module, flake outputs and evaluation fixture. |
 | `devenv.nix`, `devenv.yaml`, `.envrc` | Development shell and scripts. |
 | `tests/nixos-test.nix` | Evaluation-only NixOS fixture. |
-| `.github/workflows/ci.yml` | CI: `go vet`, `go test`, `go build`. |
+| `scripts/install-boot.sh` | Renders and installs the systemd boot units on a Podman host. Run as the operator; it calls sudo. |
+| `.github/workflows/ci.yml` | CI: `go vet`, `go test`, `go build`, boot script dry run. |
 | `celine.toml`, `secretspec.toml`, `.sops.yaml` | Deployment declaration, secret declarations, SOPS recipients. |
 | `docs/` | Architecture, configuration, operations, migration reference. |
 | `data/`, `state/`, `backups/`, `config/`, `config.backup/`, `secrets/` | Runtime and legacy data. Ignored by Git. |
@@ -62,14 +63,15 @@ nix build .#default
 nix eval .#nixosConfigurations.celine-test.config.system.build.toplevel.drvPath
 ```
 
-For systemd unit changes:
+For systemd unit or boot-script changes:
 
 ```bash
 go run ./cmd/celine systemd render
 systemd-analyze verify build/systemd/*.service build/systemd/*.timer
+./scripts/install-boot.sh --dry-run
 ```
 
-Installing units requires root and is the user's task. The agent environment has no root and no user DBus.
+Installing units requires root and is the user's task. The agent environment has no root and no user DBus. The NixOS module installs its own boot units through `celine.target`; the script is for Podman hosts.
 
 Keep the documentation set in step with code changes. A new command, flag, configuration key, or behavior change updates [README.md](README.md) plus the relevant file under `docs/`. CI runs the Go checks only; run the Nix checks locally when the flake, module, or package changes.
 
@@ -109,6 +111,8 @@ celine backup
 celine restore <archive> --yes
 celine migrate --yes
 celine systemd install
+scripts/install-boot.sh
+scripts/install-boot.sh --uninstall
 celine secrets materialize
 ```
 

@@ -287,19 +287,30 @@ export DOCKER_HOST=unix:///run/user/1000/podman/podman.sock
 celine systemd render
 ```
 
-Install them with root privileges:
+Install and enable them with the boot script. Run it as the operator account that owns the Podman socket, not with `sudo`; it calls `sudo` for the system directories and `systemctl`. It refuses to run as root because the units must carry your uid and `DOCKER_HOST`.
 
 ```bash
-sudo install -m644 build/systemd/celine.service \
-  build/systemd/celine-backup.service build/systemd/celine-backup.timer \
-  /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now celine.service celine-backup.timer
+scripts/install-boot.sh --dry-run   # render and print the actions
+scripts/install-boot.sh             # install, enable, and start
+scripts/install-boot.sh --uninstall # disable and remove
 ```
 
-`celine systemd install` writes the same files directly to `/etc/systemd/system` and fails without write access. Prefer `render` plus `sudo install`.
+The script renders `build/systemd/` through `celine systemd render`, installs the three units into `/etc/systemd/system`, runs `systemctl daemon-reload`, and enables `celine.service` and `celine-backup.timer`. It accepts `--celine PATH` and `--config PATH`; without `--celine` it uses `build/celine`, then `result/bin/celine`, then `celine` from `PATH`, and builds `build/celine` with Go when no binary is found. If you use a Nix-built binary, run `nix build .#default` and pass `--celine result/bin/celine`.
 
-The units render and pass `systemd-analyze verify` in this environment. The agent environment has no root and no user DBus, so installation was left to the user. The NixOS module installs its own boot and backup units.
+System units do not inherit your shell `PATH`. The rendered units capture a compact `PATH` with the user's Nix profile, stable system directories, and the directories that currently provide `docker`, `tailscale`, `secretspec`, `sops`, and `sqlite3`. Rerun the script if a tool moves.
+
+`celine systemd install` is the low-level alternative. It writes the files directly to `/etc/systemd/system` and fails without write access, so `scripts/install-boot.sh` is the supported path.
+
+After changing paths, units, or `DOCKER_HOST`, rerun the script and restart the service:
+
+```bash
+scripts/install-boot.sh
+sudo systemctl restart celine.service
+```
+
+The units render and pass `systemd-analyze verify`, and the script's `--dry-run` path runs in CI. The agent environment has no root and no user DBus, so unit installation was left to you.
+
+On NixOS, do not use the script. The module defines `celine.target`, which wants `calibre-server.service`, `kavita.service`, `celine-secrets.service`, `celine-tailnet.service`, and `celine-backup.timer`. `nixos-rebuild switch` installs and starts the target; `systemctl status celine.target` and `systemctl status celine-backup.timer` show the boot state.
 
 ## Disk and mount
 

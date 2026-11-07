@@ -144,6 +144,7 @@ func TestSystemdUnits(t *testing.T) {
 		DockerHost: "unix:///run/user/1000/podman/podman.sock",
 		MediaRoot:  "/media",
 		OnCalendar: "daily",
+		PathEnv:    "/home/mei/.nix-profile/bin:/usr/bin:/bin",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +154,7 @@ func TestSystemdUnits(t *testing.T) {
 		"RequiresMountsFor=/media",
 		"User=mei",
 		"Environment=DOCKER_HOST=unix:///run/user/1000/podman/podman.sock",
+		"Environment=PATH=/home/mei/.nix-profile/bin:/usr/bin:/bin",
 		"ExecStart=/nix/store/celine/bin/celine up --config /repo/celine.toml",
 		"WantedBy=multi-user.target",
 	} {

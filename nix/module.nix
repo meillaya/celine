@@ -196,6 +196,20 @@ in
           "d ${cfg.stateDir} 0700 kavita kavita -"
           "d ${cfg.stateDir}/secrets 0700 kavita kavita -"
         ];
+
+        # One target anchors every boot unit. Upstream services already carry
+        # their own wantedBy entries; this target makes the complete boot set
+        # explicit and gives operators `systemctl status celine.target`.
+        systemd.targets.celine = {
+          description = "Celine Calibre and Kavita stack";
+          wantedBy = [ "multi-user.target" ];
+          wants =
+            lib.optionals c.calibre.enable [ "calibre-server.service" ]
+            ++ lib.optionals c.kavita.enable [ "kavita.service" ]
+            ++ lib.optionals materializeToken [ "celine-secrets.service" ]
+            ++ lib.optionals (cfg.tailnet.enable && c.tailnet.enable) [ "celine-tailnet.service" ]
+            ++ lib.optionals cfg.backup.enable [ "celine-backup.timer" ];
+        };
       }
 
       (lib.mkIf c.calibre.enable {

@@ -21,4 +21,9 @@ jobs:
         run: go test ./...
 
       - name: go build
-        run: go build ./cmd/celine
+        run: |
+          mkdir -p build
+          go build -o build/celine ./cmd/celine
+
+      - name: boot script dry run
+        run: ./scripts/install-boot.sh --dry-run

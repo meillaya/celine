@@ -74,6 +74,13 @@ Run these steps from the repository root with the media drive mounted and `tails
    - Kavita: https://massive-1.tailf8e61e.ts.net/
    - Calibre: https://massive-1.tailf8e61e.ts.net:8443/
 
+7. Install the boot units once. The script renders the units with your uid, `DOCKER_HOST`, and a stable tool `PATH`, then uses `sudo` for `/etc/systemd/system` and `systemctl`. It refuses to run as root and builds `build/celine` with Go if no binary is available.
+
+   ```bash
+   scripts/install-boot.sh
+   scripts/install-boot.sh --dry-run   # print the actions first
+   ```
+
 This host is already deployed: `state/`, `secrets/celine.enc.yaml`, and `backups/` exist. Do not rerun `celine migrate` without `--force`. Run `celine up` to converge configuration changes.
 
 ## Daily commands
@@ -85,6 +92,7 @@ This host is already deployed: `state/`, `secrets/celine.enc.yaml`, and `backups
 | Run preflight and health checks | `celine doctor --strict` |
 | Follow Kavita logs | `celine logs -f kavita` |
 | Start or stop the containers | `celine up`, `celine down` |
+| Install or remove boot units | `scripts/install-boot.sh`, `scripts/install-boot.sh --uninstall` |
 | Apply or remove Tailscale Serve | `celine tailnet apply`, `celine tailnet down` |
 | Archive state now | `celine backup` |
 | Restore an archive | `celine restore backups/<archive> --yes` |
@@ -109,7 +117,7 @@ The host ports in `celine.toml` are loopback ports. The containers always listen
 
 ## NixOS deployment
 
-The flake exposes `packages.default` and `nixosModules.default`. The module runs the upstream `services.calibre-server` and `services.kavita` options, binds media and state, materializes the Kavita token through SecretSpec into `services.kavita.credentials.token_key`, applies Tailscale Serve, and schedules backups.
+The flake exposes `packages.default` and `nixosModules.default`. The module runs the upstream `services.calibre-server` and `services.kavita` options, binds media and state, materializes the Kavita token through SecretSpec into `services.kavita.credentials.token_key`, applies Tailscale Serve, and schedules backups. A `celine.target` unit groups the two services, the SecretSpec materialization, the Tailscale Serve unit, and the backup timer, so `nixos-rebuild switch` installs boot persistence and `systemctl status celine.target` shows the boot set. The install script is for Podman hosts; NixOS does not use it.
 
 ```nix
 services.celine = {

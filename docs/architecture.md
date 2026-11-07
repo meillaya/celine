@@ -12,7 +12,9 @@ Celine deploys the Calibre content server and Kavita from one declaration. The l
 | Rootless Podman with the Compose provider | user session | Run the two containers, publish loopback ports, bind-mount media and state |
 | `build/compose.yaml` | generated | Rendered Compose document consumed by `docker compose` through the Podman socket |
 | `tailscaled` and Tailscale Serve | host service | Terminate HTTPS for the tailnet and proxy to host loopback ports |
-| `celine.service`, `celine-backup.timer` | system systemd | Start the stack at boot and run scheduled backups |
+| `celine.service`, `celine-backup.timer` | system systemd | Start the stack at boot and run scheduled backups on Podman hosts |
+| `scripts/install-boot.sh` | operator shell | Render and install the Podman boot units; uses sudo for system paths |
+| `celine.target` | NixOS | Group the native services, token unit, Tailscale unit, and backup timer for boot and inspection |
 | NixOS module ([nix/module.nix](../nix/module.nix)) | NixOS host | Native alternative that runs upstream `services.calibre-server` and `services.kavita` |
 | External drive | `/dev/sda1` mounted at the repository path | Media, state, and backups |
 
@@ -148,12 +150,12 @@ State creates the parts that are not reproducible:
 
 ## Deployment paths
 
-The local path runs on this host: `celine up` renders Compose, Podman runs the containers, and the generated system units start the stack at boot as the invoking user. The systemd path and the CLI share the same `celine.toml` and the same `DOCKER_HOST`.
+The local path runs on this host: `celine up` renders Compose, Podman runs the containers, and `scripts/install-boot.sh` installs the generated system units so the stack starts at boot as the invoking user. The script renders with the operator's uid and `DOCKER_HOST`, then uses `sudo` only for `/etc/systemd/system` and `systemctl`.
 
-The NixOS path uses the same declaration inside a NixOS configuration. The module enables the upstream `services.calibre-server` and `services.kavita`, binds `media_root/Kavita` at `kavita.library_mount` and `stateDir/kavita/config` at `/app/kavita/config`, materializes the token, applies Tailscale Serve from a oneshot unit, and schedules the backup timer. The flake exposes `packages.default`, `nixosModules.default`, and an evaluation-only `nixosConfigurations.celine-test` fixture. The two paths own the same ports and Tailscale HTTPS ports, so use them on separate hosts.
+The NixOS path uses the same declaration inside a NixOS configuration. The module enables the upstream `services.calibre-server` and `services.kavita`, binds `media_root/Kavita` at `kavita.library_mount` and `stateDir/kavita/config` at `/app/kavita/config`, materializes the token, applies Tailscale Serve from a oneshot unit, and schedules the backup timer. A `celine.target` wants every boot unit, so a switch installs boot persistence and `systemctl status celine.target` shows the complete set. The flake exposes `packages.default`, `nixosModules.default`, and an evaluation-only `nixosConfigurations.celine-test` fixture. The two paths own the same ports and Tailscale HTTPS ports, so use them on separate hosts.
 
 ## Validation status
 
 Verified live on this host on 2026-11-07: `celine migrate --yes`, `celine up --build`, `celine tailnet apply`, `celine status`, `celine status --json`, `celine doctor --strict` (25 ok, 0 warn, 0 fail), `celine backup`, `celine restore` into a separate `--state-dir` copy, and `celine render --check`. Both tailnet URLs answer 200 with a Let's Encrypt certificate.
 
-Not exercised in this environment: `celine restore` against live state, `celine systemd install` (requires root; the units render and pass `systemd-analyze verify`), rootful container runtime behavior, and a NixOS host deployment (the module is evaluated by `nix flake check`).
+Not exercised in this environment: `celine restore` against live state, `scripts/install-boot.sh` installation (requires root; its `--dry-run` path runs in CI), rootful container runtime behavior, and a NixOS host deployment (the module is evaluated by `nix flake check`).
