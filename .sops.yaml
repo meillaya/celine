@@ -1,0 +1,19 @@
+# SOPS creation rule for the Celine secret store.
+#
+# The recipients mirror ~/nixos/.sops.yaml: the workstation identity decrypts
+# on this machine, and the GitHub-derived identity covers NixOS hosts that
+# install the fleet SSH key. Public keys only; private material stays on hosts.
+keys:
+  - &admin age1xxj3ft4g9gkfryedx85z9je76s07xxfqcvzl4c3t777d45hfgpvqwkpclc
+  - &recovery age1f3fgneph45yn900kqvzkysztspyz7puh9uqneujpxft5rsqjeglq99lnz0
+  - &workstation age12kpavl6rfve4kgcacq0ysr4fxw5gx29fnfy2hs55av4qxj3yug6serx5yn
+  - &github age1f7d77pdq406qvm9teng652sefew8f8v0qvcmayqn5zsgq2x8q3wsw65lkj
+
+creation_rules:
+  - path_regex: ^secrets/celine\.enc\.yaml$
+    key_groups:
+      - age:
+          - *admin
+          - *recovery
+          - *workstation
+          - *github

@@ -1,0 +1,107 @@
+# Celine: declarative Calibre and Kavita libraries over Tailscale.
+#
+# This file is the single source of truth for deployment. Secrets do not belong
+# here; they are declared in secretspec.toml and resolved through SecretSpec.
+#
+# Paths are relative to this file unless they start with "/". Rendering
+# resolves them against the repository root on every target.
+
+[meta]
+schema = 1
+
+[paths]
+media_root = "data"
+state_dir = "state"
+backup_dir = "backups"
+
+[runtime]
+# Rootless Podman is the local runtime. With rootless=true the containers keep
+# their own root inside a user namespace, so host files stay owned by the
+# calling user. Set false only for a rootful Docker daemon.
+rootless = true
+# Containers need an IANA timezone, not the host's "Local" alias.
+timezone = "America/Toronto"
+
+[calibre]
+enable = true
+# Pinned upstream release built by docker/calibre.Dockerfile.
+version = "9.18.0"
+# Loopback port on the host. The container always listens on internal port
+# 8080; Compose publishes 127.0.0.1:<port>:8080.
+port = 18080
+
+# Every entry is a Calibre library directory under media_root and must contain
+# metadata.db. Cooking is intentionally absent: the directory exists but has no
+# metadata database yet.
+[[calibre.libraries]]
+name = "Comics"
+path = "Calibre/Comics"
+
+[[calibre.libraries]]
+name = "Fantasy - Science Fiction"
+path = "Calibre/Fantasy - Science Fiction"
+
+[[calibre.libraries]]
+name = "General"
+path = "Calibre/General"
+
+[[calibre.libraries]]
+name = "Memory of the World"
+path = "Calibre/Memory of the World"
+
+[[calibre.libraries]]
+name = "NYRB"
+path = "Calibre/NYRB"
+
+[[calibre.libraries]]
+name = "Philosophy"
+path = "Calibre/Philosophy"
+
+[[calibre.libraries]]
+name = "Science and Math"
+path = "Calibre/Science and Math"
+
+[[calibre.libraries]]
+name = "Temp"
+path = "Calibre/Temp"
+
+[[calibre.libraries]]
+name = "Theory"
+path = "Calibre/Theory"
+
+[kavita]
+enable = true
+image = "lscr.io/linuxserver/kavita:version-v0.9.1.4"
+# Loopback port on the host.
+port = 5000
+# Kavita's library root on disk, relative to media_root.
+library_subdir = "Kavita"
+# The absolute path Kavita sees for that root. The container mounts it here and
+# the NixOS module binds it here, so the existing database paths keep working.
+library_mount = "/data"
+cache = 75
+base_url = "/"
+allow_iframing = false
+
+[tailnet]
+enable = true
+# Empty means "read the MagicDNS name from `tailscale status --json`".
+hostname = ""
+
+# Tailscale Serve cannot strip app paths without breaking absolute links, so
+# each app gets its own HTTPS port. Only 443, 8443, and 10000 are valid for
+# Tailscale HTTPS.
+[[tailnet.serve]]
+service = "kavita"
+https_port = 443
+
+[[tailnet.serve]]
+service = "calibre"
+https_port = 8443
+
+[backup]
+enable = true
+# Archives kept under backup_dir, newest first.
+retention = 10
+# systemd OnCalendar expression used by the generated timer and the NixOS module.
+on_calendar = "daily"

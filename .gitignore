@@ -1,20 +1,29 @@
-# Kavita Docker - Git Ignore
+# Celine - Git Ignore
 
-# Configuration and data directories (contain user data)
-config/
-data/
+# Runtime data and state. These live on the media drive and are never committed.
+/config/
+/config.backup/
+/data/
+/state/
+/backups/
+/build/
 
-# Environment files (may contain secrets)
+# Local tooling caches
+/.cache/
+/.gopath/
+/.devenv/
+/.direnv/
+/.runtime/
+/result
+/result-*
+
+# Secrets: only the SOPS-encrypted store is tracked.
+/secrets/*.plain.*
+/secrets/*.dec.*
+/secrets/*.tmp
 .env
 .env.local
 .env.*.local
-
-# Railway local files (if using Railway CLI)
-.railway/
-
-# Docker volumes (if stored locally)
-volumes/
-*.volume/
 
 # Logs
 *.log
