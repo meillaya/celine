@@ -65,7 +65,7 @@ func ReadInventory(ctx context.Context, runner execx.Runner, sqlite, dbPath stri
 }
 
 func queryJSON(ctx context.Context, runner execx.Runner, sqlite, dbPath, query string, target any) error {
-	result, err := runner.Run(ctx, sqlite, []string{"-readonly", "-json", dbPath, query}, execx.Options{})
+	result, err := runner.Run(ctx, sqlite, []string{"-readonly", "-cmd", ".timeout 5000", "-json", dbPath, query}, execx.Options{})
 	if err != nil {
 		return err
 	}
@@ -81,7 +81,7 @@ func queryJSON(ctx context.Context, runner execx.Runner, sqlite, dbPath, query s
 
 // IntegrityCheck verifies the database file.
 func IntegrityCheck(ctx context.Context, runner execx.Runner, sqlite, dbPath string) error {
-	result, err := runner.Run(ctx, sqlite, []string{"-readonly", dbPath, "PRAGMA integrity_check;"}, execx.Options{})
+	result, err := runner.Run(ctx, sqlite, []string{"-readonly", "-cmd", ".timeout 5000", dbPath, "PRAGMA integrity_check;"}, execx.Options{})
 	if err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func Backup(ctx context.Context, runner execx.Runner, sqlite, dbPath, destinatio
 		return err
 	}
 	query := fmt.Sprintf(".backup %s", sqliteLiteral(destination))
-	if _, err := runner.Run(ctx, sqlite, []string{dbPath, query}, execx.Options{}); err != nil {
+	if _, err := runner.Run(ctx, sqlite, []string{"-cmd", ".timeout 5000", dbPath, query}, execx.Options{}); err != nil {
 		return fmt.Errorf("backup Kavita database: %w", err)
 	}
 	return nil
@@ -121,7 +121,12 @@ func HostPath(runtimePath, mount, hostRoot string) (string, bool) {
 		return "", false
 	}
 	rest := strings.TrimPrefix(cleanPath, cleanMount+"/")
-	return filepath.Join(hostRoot, filepath.FromSlash(rest)), true
+	target := filepath.Join(hostRoot, filepath.FromSlash(rest))
+	rel, err := filepath.Rel(hostRoot, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return target, true
 }
 
 func sqliteLiteral(value string) string {

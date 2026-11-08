@@ -39,8 +39,9 @@ Flags:
 | Flag | Effect |
 | --- | --- |
 | `--yes` | Required. The command copies data and may write a secret store. |
-| `--force` | Replace an existing `state/kavita/config/kavita.db`. The old directory is renamed to `state/kavita/config.pre-migrate-<stamp>`. |
+| `--force` | Replace any existing content under `state/kavita/config`. The old directory is renamed to `state/kavita/config.pre-migrate-<stamp>`. |
 | `--no-secret-import` | Skip the signing-key import. SecretSpec generates a key on the first start, and existing sessions become invalid. |
+| `--stop-services` | Stop the running Celine stack before replacing live state. Without it, a running stack is refused. |
 | `--state-dir PATH` | Override `paths.state_dir` for this run. |
 | `--backup-dir PATH` | Override `paths.backup_dir` for this run. |
 | `--secret-file PATH` | Write the SOPS store here instead of `secrets/celine.enc.yaml`. |
@@ -48,16 +49,15 @@ Flags:
 Steps, in order:
 
 1. Require `config/kavita.db`. A missing legacy database aborts the migration before any write.
-2. Create the state and backup directories.
-3. Archive the entire legacy `config/` directory to `backups/legacy-config-<UTC timestamp>.tar.gz` with mode 0600, then read the archive back and verify that it contains `kavita.db`. A failed verification aborts the migration.
-4. Check for an existing `state/kavita/config/kavita.db`. Without `--force`, the command stops and tells you to rerun with `--force`. The legacy directory remains untouched.
-5. Copy the legacy tree into a temporary staging directory under the state directory.
-6. Run `PRAGMA integrity_check` on the copied database and read the user, library, folder, and version rows. A database with zero users aborts the migration, because installing it would replace a working deployment with an empty one.
-7. When an existing state database is present and `--force` is set, rename `state/kavita/config` to `state/kavita/config.pre-migrate-<stamp>`.
-8. Move the staged tree into `state/kavita/config`.
-9. Unless `--no-secret-import` is set, read `TokenKey` from the copied `appsettings.json` and import it into the SOPS store. The signing-key rules are below.
-10. On a successful import, write `state/.migration.json` with the migration time, source directory, archive path, Kavita version, user and library counts, and whether the token was imported.
-11. Print the backup archive, state directory, Kavita inventory, signing-key result, any discoveries, and the next command, `celine up --build`.
+2. Preflight the target. Any content under `state/kavita/config` is a conflict without `--force`; no archive or state write has happened yet.
+3. Copy the legacy tree into a temporary staging directory under the state directory.
+4. Run `PRAGMA integrity_check` on the copied database and read the user, library, folder, and version rows. A database with zero users aborts the migration, because installing it would replace a working deployment with an empty one.
+5. Archive the entire legacy `config/` directory to `backups/legacy-config-<UTC timestamp>.tar.gz` with mode 0600, then read the archive back and verify that it contains `kavita.db`. A failed verification aborts before live state is touched.
+6. Unless `--no-secret-import` is set, read `TokenKey` from the staged `appsettings.json` and import it into the SOPS store. The signing-key rules are below. An import failure aborts before the state directory is replaced.
+7. When a non-empty target exists and `--force` is set, rename it to `state/kavita/config.pre-migrate-<stamp>`. If installing the staged tree fails, the old directory is renamed back.
+8. Move the staged tree into `state/kavita/config` and set the config directory to 0700 and the database/appsettings to 0600.
+9. Write `state/.migration.json` with the migration time, source directory, archive path, Kavita version, user and library counts, token presence/import/match state, and any discoveries.
+10. Print the backup archive, state directory, Kavita inventory, signing-key result, any discoveries, and the next command, `celine up --build`.
 
 The first migration on this host completed: one user, three libraries, database version 0.9.0.2, signing key imported, and the legacy archive at `backups/legacy-config-20261107T165434Z.tar.gz`.
 
@@ -67,18 +67,18 @@ The first migration on this host completed: one user, three libraries, database 
 - `config.backup/` and the old `backups/kavita_config_*.tar.gz` archives are left alone.
 - Media in `data/` is not copied, moved, or modified.
 - Existing SOPS stores that decrypt successfully are not rewritten. See the signing-key rules.
-- Containers, images, Tailscale Serve handlers, and installed systemd units are not changed. The migration stops nothing, so stop the legacy deployment first.
+- Containers, images, Tailscale Serve handlers, and installed systemd units are not changed unless you pass `--stop-services`, which stops the containers before the state swap. Stop a legacy deployment manually first.
 
 ## Signing-key import
 
 Kavita signs session tokens with the `TokenKey` in `appsettings.json`. Reusing the legacy value keeps existing sessions valid after the move to Celine.
 
-- `celine migrate` reads `TokenKey` from the copied legacy `appsettings.json`.
-- When no SOPS store exists, the CLI writes a temporary plaintext YAML file with `KAVITA_TOKEN_KEY`, encrypts it with `sops encrypt --filename-override secrets/celine.enc.yaml --output secrets/celine.enc.yaml`, sets mode 0600, and decrypts it once to verify the key name is present.
-- When the store exists and decrypts, the CLI leaves it unchanged and reports the signing key as imported. It does not compare the stored value with the legacy value.
-- When the store exists and cannot be decrypted, the CLI records a discovery message, finishes the migration, and leaves the store in place. The first start then fails at secret resolution until the store is fixed.
-- When the legacy `appsettings.json` has no readable `TokenKey`, the CLI records a discovery message and skips the import. SecretSpec generates a key on the first start.
-- With `--no-secret-import`, the CLI skips the import entirely and does not write the migration marker.
+- `celine migrate` reads `TokenKey` from the staged legacy `appsettings.json` before state is replaced.
+- When no SOPS store exists, the CLI writes a temporary plaintext YAML file with `KAVITA_TOKEN_KEY`, encrypts it to a temporary output with `sops encrypt --filename-override secrets/celine.enc.yaml`, decrypts it, checks that it round-trips to the legacy value, sets mode 0600, and renames it into place.
+- When the store exists and decrypts, the CLI compares the stored value and leaves the store unchanged. The CLI reports whether the key matches; it no longer claims an import it did not perform.
+- When the store exists and cannot be decrypted or is malformed, the migration aborts before replacing state. Fix the store and retry; the legacy directory is untouched.
+- When the legacy `appsettings.json` has no readable `TokenKey`, the CLI records a discovery message and continues. SecretSpec generates a key on the first start.
+- With `--no-secret-import`, the CLI skips the import; the migration marker still records the migration.
 - On a fresh store, generated keys invalidate old sessions. Users sign in again; reading progress and libraries are unaffected.
 
 To force the legacy key into a store that already exists, move the store aside and migrate again. This replaces the key in use, so it also invalidates sessions that were issued with the previous key.
@@ -140,7 +140,7 @@ Symptoms: the Kavita container restarts repeatedly, `celine logs kavita` shows a
 1. Stop the containers.
 2. Restore the newest celine archive, or re-import the legacy configuration.
 3. Start with the earlier Kavita image tag, so the database schema matches the application version.
-4. Verify with `celine doctor --strict`, then plan the upgrade again.
+4. Verify with `celine doctor --strict --expect-running`, then plan the upgrade again.
 
 ```bash
 celine down
@@ -165,8 +165,8 @@ Keep the failed state directory until the deployment is healthy. It contains the
 
 1. Run `celine validate` and `celine doctor`.
 2. Run `celine up --build`.
-3. Run `celine doctor --strict`. The expected result is every check `ok`.
+3. Run `celine doctor --strict --expect-running`. The expected result is every check `ok`.
 4. Confirm the tailnet URLs and sign in to Kavita. Existing sessions that used the imported signing key stay valid.
 5. Keep `config/` and the legacy archives on disk until the declarative deployment has run successfully for a while.
 
-The migration, the first start, the database upgrade, the first backup, and a restore into a separate `--state-dir` copy were exercised live on this host on 2026-11-07. The `--force` migration path, a restore over live state, and the failed-upgrade recovery above were not exercised against live state.
+The migration, the first start, the database upgrade, the first backup, and a restore into a separate `--state-dir` copy were exercised live on this host on 2026-11-07. The `--force` migration path, a restore over live state, and the failed-upgrade recovery above were not exercised against live state. The 2026-11-08 remediation changes the migration order and secret-import behavior; rerun `celine doctor --strict --expect-running` after the first migrated start and expect boot/linger/permission checks to fail until the operator steps in [operations.md](operations.md) are completed.

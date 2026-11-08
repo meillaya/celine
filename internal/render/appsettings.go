@@ -30,6 +30,10 @@ func AppSettings(cfg *config.Config, token string, existing []byte, target Targe
 			return nil, fmt.Errorf("parse existing appsettings.json: %w", err)
 		}
 	}
+	if data == nil {
+		// A file containing the JSON literal null decodes to a nil map.
+		data = map[string]any{}
+	}
 
 	ipAddresses := "0.0.0.0,::"
 	port := cfg.Kavita.Port

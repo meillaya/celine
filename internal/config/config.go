@@ -348,8 +348,13 @@ func (c *Config) Validate(opts ValidateOptions) error {
 		if _, err := safeRelativePath(c.Kavita.LibrarySubdir); err != nil {
 			add("kavita.library_subdir: %v", err)
 		}
+		cleanMount := filepath.Clean(c.Kavita.LibraryMount)
 		if !filepath.IsAbs(c.Kavita.LibraryMount) {
 			add("kavita.library_mount must be absolute, got %q", c.Kavita.LibraryMount)
+		} else if cleanMount == "/" {
+			add("kavita.library_mount must not be /")
+		} else if cleanMount != c.Kavita.LibraryMount {
+			add("kavita.library_mount must be a clean absolute path, got %q (want %q)", c.Kavita.LibraryMount, cleanMount)
 		}
 		if c.Kavita.Cache < 0 {
 			add("kavita.cache must not be negative")
@@ -357,6 +362,9 @@ func (c *Config) Validate(opts ValidateOptions) error {
 		if !strings.HasPrefix(c.Kavita.BaseURL, "/") {
 			add("kavita.base_url must start with /, got %q", c.Kavita.BaseURL)
 		}
+	}
+	if c.Calibre.Enable && c.Kavita.Enable && c.Calibre.Port == c.Kavita.Port {
+		add("calibre.port and kavita.port must differ, both are %d", c.Calibre.Port)
 	}
 
 	if c.Tailnet.Enable {
@@ -399,16 +407,23 @@ func (c *Config) Validate(opts ValidateOptions) error {
 	}
 
 	if c.Backup.Enable {
-		if c.Backup.Retention < 1 {
-			add("backup.retention must be at least 1")
+		if strings.TrimSpace(c.Paths.BackupDir) == "" {
+			add("paths.backup_dir must be set when backup.enable is true")
 		}
 		if strings.TrimSpace(c.Backup.OnCalendar) == "" {
 			add("backup.on_calendar must not be empty")
 		}
 	}
+	// Retention is also used by manual `celine backup` runs when the scheduled
+	// timer is disabled, so it must always be a valid count.
+	if c.Backup.Retention < 1 {
+		add("backup.retention must be at least 1, got %d", c.Backup.Retention)
+	}
 
-	if _, err := os.Stat(c.Resolved.SecretspecPath); err != nil {
-		add("secretspec.toml is missing next to celine.toml (%s)", c.Resolved.SecretspecPath)
+	if c.Kavita.Enable {
+		if _, err := os.Stat(c.Resolved.SecretspecPath); err != nil {
+			add("secretspec.toml is missing next to celine.toml (%s)", c.Resolved.SecretspecPath)
+		}
 	}
 
 	if opts.CheckFilesystem {

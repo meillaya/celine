@@ -40,6 +40,9 @@ type App struct {
 	Username   string
 	Home       string
 	HTTPClient *http.Client
+	// IsRoot overrides the effective-uid check in tests. Production leaves it
+	// nil and uses os.Geteuid.
+	IsRoot *bool
 }
 
 func (a App) withDefaults() App {
@@ -126,6 +129,9 @@ func Run(args []string, app App) int {
 	rest := args[1:]
 	switch command {
 	case "help", "-h", "--help":
+		if len(args) > 1 {
+			return Run([]string{args[1], "-h"}, app)
+		}
 		app.printUsage()
 		return 0
 	case "version", "--version", "-V":
@@ -193,6 +199,8 @@ Common flags:
   --config PATH       Path to celine.toml (default: walk up from cwd)
   --root PATH         Treat PATH as the repository root
   --secretspec PATH   Path to secretspec.toml (default: next to celine.toml)
+
+Run 'celine <command> -h' for command-specific flags.
 
 Deploy:
   celine migrate --yes
@@ -345,24 +353,74 @@ func waitHTTP(ctx context.Context, client *http.Client, url string) error {
 }
 
 // reorderFlags lets users put positional arguments before flags, which the
-// standard flag package does not allow. valueFlags names flags that consume the
-// following argument.
-func reorderFlags(args []string, valueFlags map[string]bool) []string {
+// standard flag package does not allow. Value-taking flags are discovered from
+// the FlagSet so --config, --root, --secretspec, --state-dir, and any future
+// string/int flag are all handled.
+func reorderFlags(set *flag.FlagSet, args []string) []string {
 	var flags, positional []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
 		if strings.HasPrefix(arg, "-") && arg != "-" {
 			flags = append(flags, arg)
-			name := strings.SplitN(arg, "=", 2)[0]
-			if valueFlags[name] && !strings.Contains(arg, "=") && i+1 < len(args) {
-				i++
-				flags = append(flags, args[i])
+			if strings.Contains(arg, "=") {
+				continue
+			}
+			name := strings.TrimLeft(arg, "-")
+			if f := set.Lookup(name); f != nil {
+				if boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool }); !ok || !boolFlag.IsBoolFlag() {
+					if i+1 < len(args) {
+						i++
+						flags = append(flags, args[i])
+					}
+				}
 			}
 			continue
 		}
 		positional = append(positional, arg)
 	}
 	return append(flags, positional...)
+}
+
+// noPositional rejects stray arguments for commands that take none.
+func noPositional(set *flag.FlagSet, app App) (int, bool) {
+	if set.NArg() == 0 {
+		return 0, false
+	}
+	app.errOut("%s does not accept positional arguments: %s", set.Name(), strings.Join(set.Args(), " "))
+	return 2, true
+}
+
+func samePath(first, second string) bool {
+	if first == "" || second == "" {
+		return false
+	}
+	a, errA := filepath.Abs(first)
+	b, errB := filepath.Abs(second)
+	if errA != nil || errB != nil {
+		return false
+	}
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
+}
+
+func primaryGroup(username string) string {
+	current, err := user.Lookup(username)
+	if err != nil {
+		return username
+	}
+	group, err := user.LookupGroupId(current.Gid)
+	if err != nil {
+		return username
+	}
+	return group.Name
 }
 
 func envValue(app App, name, fallback string) string {

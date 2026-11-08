@@ -73,6 +73,7 @@ func calibreService(cfg *config.Config, uid, gid int) map[string]any {
 		"ports": []string{
 			fmt.Sprintf("127.0.0.1:%d:%d", cfg.Calibre.Port, internalCalibrePort),
 		},
+		"stop_grace_period": "15s",
 		"healthcheck": map[string]any{
 			"test":         []string{"CMD-SHELL", fmt.Sprintf("curl -fsS http://127.0.0.1:%d/ >/dev/null || exit 1", internalCalibrePort)},
 			"interval":     "30s",
@@ -108,6 +109,9 @@ func kavitaService(cfg *config.Config, uid, gid int) map[string]any {
 		"ports": []string{
 			fmt.Sprintf("127.0.0.1:%d:%d", cfg.Kavita.Port, internalKavitaPort),
 		},
+		// Give Kavita time to flush its SQLite database on shutdown instead of
+		// letting Compose SIGKILL it after the default 10 seconds.
+		"stop_grace_period": "30s",
 		"healthcheck": map[string]any{
 			"test":         []string{"CMD-SHELL", fmt.Sprintf("curl -fsS http://127.0.0.1:%d/api/health >/dev/null || exit 1", internalKavitaPort)},
 			"interval":     "30s",

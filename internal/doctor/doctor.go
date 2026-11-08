@@ -2,17 +2,19 @@
 package doctor
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Meillaya/celine/internal/backup"
 	"github.com/Meillaya/celine/internal/compose"
 	"github.com/Meillaya/celine/internal/config"
 	"github.com/Meillaya/celine/internal/execx"
@@ -36,10 +38,10 @@ const (
 
 // Check is one named result.
 type Check struct {
-	Name   string
-	Level  Level
-	Detail string
-	Hint   string
+	Name   string `json:"name"`
+	Level  Level  `json:"level"`
+	Detail string `json:"detail"`
+	Hint   string `json:"hint,omitempty"`
 }
 
 // URL is a published service address.
@@ -68,6 +70,16 @@ type Deps struct {
 	Version    string
 	Now        func() time.Time
 	HTTPClient *http.Client
+	// ExpectRunning turns a free service port into a failure. Doctor remains a
+	// valid preflight tool without it.
+	ExpectRunning bool
+	UID           int
+	GID           int
+	User          string
+	SystemdDir    string
+	IsNixOS       bool
+	Systemctl     string
+	Loginctl      string
 }
 
 func (r *Report) add(name string, level Level, detail, hint string) {
@@ -114,6 +126,27 @@ func Run(ctx context.Context, deps Deps) Report {
 	}
 	if deps.HTTPClient == nil {
 		deps.HTTPClient = &http.Client{Timeout: 2 * time.Second}
+	}
+	if deps.UID == 0 && deps.GID == 0 {
+		deps.UID = os.Getuid()
+		deps.GID = os.Getgid()
+	}
+	if deps.User == "" {
+		deps.User = os.Getenv("USER")
+	}
+	if deps.SystemdDir == "" {
+		deps.SystemdDir = "/etc/systemd/system"
+	}
+	if deps.Systemctl == "" {
+		deps.Systemctl = "systemctl"
+	}
+	if deps.Loginctl == "" {
+		deps.Loginctl = "loginctl"
+	}
+	if !deps.IsNixOS {
+		if _, err := os.Stat("/etc/NIXOS"); err == nil {
+			deps.IsNixOS = true
+		}
 	}
 	cfg := deps.Config
 	if cfg == nil {
@@ -176,19 +209,20 @@ func Run(ctx context.Context, deps Deps) Report {
 					} else {
 						report.add("kavita database", OK, detail, "")
 					}
-					missing := 0
+					unresolved := 0
 					for _, folder := range inventory.FolderPaths {
 						hostPath, ok := kavita.HostPath(folder.Path, cfg.Kavita.LibraryMount, cfg.KavitaMediaHostPath())
 						if !ok {
+							unresolved++
 							report.add("kavita folder", Warn, "unmapped path "+folder.Path, "the library is outside "+cfg.Kavita.LibraryMount)
 							continue
 						}
 						if info, err := os.Stat(hostPath); err != nil || !info.IsDir() {
-							missing++
+							unresolved++
 							report.add("kavita folder", Fail, "missing "+hostPath, "restore the media drive or update the library path")
 						}
 					}
-					if missing == 0 {
+					if unresolved == 0 {
 						report.add("kavita folders", OK, "all declared library paths resolve", "")
 					}
 				}
@@ -197,7 +231,7 @@ func Run(ctx context.Context, deps Deps) Report {
 	}
 
 	// Secrets.
-	if deps.Secrets != nil {
+	if deps.Secrets != nil && cfg.Kavita.Enable {
 		if _, err := deps.Secrets.Check(ctx); err != nil {
 			report.add("secrets", Fail, err.Error(), "run `secretspec check` and provide KAVITA_TOKEN_KEY")
 		} else {
@@ -205,8 +239,8 @@ func Run(ctx context.Context, deps Deps) Report {
 		}
 	}
 
-	// Runtime.
-	if deps.Runner != nil {
+	// Runtime. The native NixOS path runs host services, not Compose.
+	if deps.Runner != nil && !deps.IsNixOS {
 		client := compose.New(deps.Runner, filepath.Join(cfg.Root, "build", "compose.yaml"))
 		client.Docker = deps.Docker
 		if info, err := client.RuntimeInfo(ctx); err != nil {
@@ -230,9 +264,15 @@ func Run(ctx context.Context, deps Deps) Report {
 			continue
 		}
 		port, _ := cfg.UpstreamPort(service)
-		level, detail := checkPort(ctx, deps.HTTPClient, service, port)
+		level, detail := checkPort(ctx, deps.HTTPClient, service, port, deps.ExpectRunning)
 		report.add(service+" port", level, detail, "stop the process using the port or change it in celine.toml")
 	}
+
+	checkBoot(&report, cfg, deps)
+	if cfg.Kavita.Enable {
+		checkAgeIdentity(&report, deps)
+	}
+	checkSecretPermissions(&report, cfg)
 
 	// Tailnet.
 	endpoints := []render.Endpoint{}
@@ -285,17 +325,34 @@ func Run(ctx context.Context, deps Deps) Report {
 	if cfg.Backup.Enable {
 		if info, err := os.Stat(cfg.Resolved.BackupDir); err != nil || !info.IsDir() {
 			report.add("backups", Warn, "backup directory does not exist yet", "run `celine backup`")
-		} else if latest, err := latestArchive(cfg.Resolved.BackupDir); err != nil {
+		} else if latest, err := backup.Latest(cfg.Resolved.BackupDir); err != nil {
 			report.add("backups", Warn, err.Error(), "")
 		} else if latest == "" {
 			report.add("backups", Warn, "no celine archive yet", "run `celine backup`")
+		} else if info, err := os.Stat(latest); err != nil {
+			report.add("backups", Warn, err.Error(), "")
 		} else {
-			info, _ := os.Stat(latest)
 			age := time.Since(info.ModTime())
 			if age > 48*time.Hour {
 				report.add("backups", Warn, fmt.Sprintf("latest archive is %s old", age.Round(time.Hour)), "run `celine backup` or enable the timer")
 			} else {
 				report.add("backups", OK, fmt.Sprintf("latest archive is %s old", age.Round(time.Minute)), "")
+			}
+			if deps.Runner != nil {
+				verified, err := backup.Verify(ctx, backup.VerifyOptions{
+					Archive:         latest,
+					Runner:          deps.Runner,
+					SQLite:          deps.SQLite,
+					RequireKavitaDB: cfg.Kavita.Enable,
+				})
+				switch {
+				case err != nil:
+					report.add("backup integrity", Fail, err.Error(), "run `celine backup` and keep the previous archive until a good one exists")
+				case verified.SecretsPresent:
+					report.add("backup integrity", Warn, "latest archive still contains a plaintext Kavita signing key", "run `celine backup` with this version to write a redacted archive")
+				default:
+					report.add("backup integrity", OK, fmt.Sprintf("%d files verified", verified.Files), "")
+				}
 			}
 		}
 	}
@@ -314,21 +371,35 @@ func Run(ctx context.Context, deps Deps) Report {
 		}
 	}
 
-	// Rendered artifacts.
+	// Rendered artifacts. The native NixOS path does not use Compose.
+	if deps.IsNixOS {
+		report.add("rendered compose", OK, "not used by the native NixOS path", "")
+		return report
+	}
 	composeFile := filepath.Join(cfg.Root, "build", "compose.yaml")
-	if _, err := os.Stat(composeFile); err != nil {
+	rendered, renderErr := render.Compose(cfg, deps.UID, deps.GID)
+	existing, readErr := os.ReadFile(composeFile)
+	switch {
+	case readErr != nil:
 		report.add("rendered compose", Warn, "missing "+composeFile, "run `celine render`")
-	} else {
+	case renderErr != nil:
+		report.add("rendered compose", Warn, renderErr.Error(), "run `celine render`")
+	case !bytes.Equal(existing, rendered):
+		report.add("rendered compose", Warn, composeFile+" is out of date", "run `celine render` or `celine up`")
+	default:
 		report.add("rendered compose", OK, composeFile, "")
 	}
 	return report
 }
 
-func checkPort(ctx context.Context, client *http.Client, service string, port int) (Level, string) {
+func checkPort(ctx context.Context, client *http.Client, service string, port int, expectRunning bool) (Level, string) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err == nil {
 		listener.Close()
-		return OK, fmt.Sprintf("127.0.0.1:%d is free", port)
+		if expectRunning {
+			return Fail, fmt.Sprintf("127.0.0.1:%d is free; %s is not listening", port, service)
+		}
+		return OK, fmt.Sprintf("127.0.0.1:%d is free (service not started)", port)
 	}
 	paths := map[string]string{"calibre": "/", "kavita": "/api/health"}
 	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, paths[service])
@@ -345,7 +416,7 @@ func checkPort(ctx context.Context, client *http.Client, service string, port in
 }
 
 func countCalibreBooks(ctx context.Context, runner execx.Runner, sqlite, dbPath string) (int, error) {
-	result, err := runner.Run(ctx, sqlite, []string{"-readonly", "-json", dbPath, "SELECT COUNT(*) AS count FROM books"}, execx.Options{})
+	result, err := runner.Run(ctx, sqlite, []string{"-readonly", "-cmd", ".timeout 5000", "-json", dbPath, "SELECT COUNT(*) AS count FROM books"}, execx.Options{})
 	if err != nil {
 		return 0, err
 	}
@@ -353,21 +424,181 @@ func countCalibreBooks(ctx context.Context, runner execx.Runner, sqlite, dbPath 
 	if raw == "" {
 		return 0, nil
 	}
-	// The JSON shape is [{"count":N}].
-	start := strings.Index(raw, "\"count\":")
-	if start < 0 {
-		return 0, fmt.Errorf("unexpected sqlite output")
+	var rows []struct {
+		Count int `json:"count"`
 	}
-	rest := raw[start+len("\"count\":"):]
-	end := strings.IndexAny(rest, "}")
-	if end >= 0 {
-		rest = rest[:end]
+	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+		return 0, fmt.Errorf("decode sqlite book count: %w", err)
 	}
-	value, err := strconv.Atoi(strings.TrimSpace(strings.TrimRight(rest, ",")))
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Count, nil
+}
+
+func checkBoot(report *Report, cfg *config.Config, deps Deps) {
+	if deps.IsNixOS {
+		if deps.Runner == nil {
+			return
+		}
+		result, err := deps.Runner.Run(context.Background(), deps.Systemctl, []string{"is-enabled", "celine.target"}, execx.Options{})
+		if err != nil || strings.TrimSpace(string(result.Stdout)) != "enabled" {
+			report.add("boot units", Warn, "celine.target is not enabled", "enable services.celine in the NixOS configuration and run nixos-rebuild switch")
+		} else {
+			report.add("boot units", OK, "celine.target is enabled", "")
+		}
+		return
+	}
+	servicePath := filepath.Join(deps.SystemdDir, "celine.service")
+	timerPath := filepath.Join(deps.SystemdDir, "celine-backup.timer")
+	serviceInstalled := fileExists(servicePath)
+	if !serviceInstalled {
+		report.add("boot units", Warn, "celine.service is not installed; boot start and scheduled backups are inactive", "run scripts/install-boot.sh")
+	}
+	if cfg.Runtime.Rootless {
+		if deps.Runner != nil {
+			result, err := deps.Runner.Run(context.Background(), deps.Loginctl, []string{"show-user", deps.User, "-p", "Linger"}, execx.Options{})
+			if err != nil || !strings.Contains(string(result.Stdout), "Linger=yes") {
+				report.add("boot linger", Warn, "user lingering is disabled; the rootless Podman socket is unavailable before login", "sudo loginctl enable-linger "+deps.User)
+			} else {
+				report.add("boot linger", OK, "user lingering is enabled", "")
+			}
+		}
+		if !podmanSocketEnabled() {
+			report.add("podman socket", Warn, "podman.socket is not enabled for the user", "systemctl --user enable --now podman.socket")
+		} else {
+			report.add("podman socket", OK, "podman.socket is enabled for the user", "")
+		}
+	}
+	if !serviceInstalled || deps.Runner == nil {
+		return
+	}
+	if result, err := deps.Runner.Run(context.Background(), deps.Systemctl, []string{"is-enabled", "celine.service"}, execx.Options{}); err != nil || strings.TrimSpace(string(result.Stdout)) != "enabled" {
+		report.add("boot service", Warn, "celine.service is not enabled", "sudo systemctl enable celine.service")
+	} else if result, err := deps.Runner.Run(context.Background(), deps.Systemctl, []string{"is-failed", "celine.service"}, execx.Options{}); err == nil && strings.TrimSpace(string(result.Stdout)) == "failed" {
+		report.add("boot service", Fail, "celine.service is in the failed state", "journalctl -u celine.service")
+	} else {
+		report.add("boot service", OK, "celine.service is enabled", "")
+	}
+	if cfg.Backup.Enable {
+		if !fileExists(timerPath) {
+			report.add("backup timer", Warn, "celine-backup.timer is not installed", "run scripts/install-boot.sh")
+		} else if result, err := deps.Runner.Run(context.Background(), deps.Systemctl, []string{"is-enabled", "celine-backup.timer"}, execx.Options{}); err != nil || strings.TrimSpace(string(result.Stdout)) != "enabled" {
+			report.add("backup timer", Warn, "celine-backup.timer is not enabled", "sudo systemctl enable --now celine-backup.timer")
+		} else if result, err := deps.Runner.Run(context.Background(), deps.Systemctl, []string{"is-active", "celine-backup.timer"}, execx.Options{}); err != nil || strings.TrimSpace(string(result.Stdout)) != "active" {
+			report.add("backup timer", Warn, "celine-backup.timer is not active", "sudo systemctl restart celine-backup.timer")
+		} else {
+			report.add("backup timer", OK, "celine-backup.timer is active", "")
+		}
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func podmanSocketEnabled() bool {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return 0, fmt.Errorf("parse book count: %w", err)
+		return true
 	}
-	return value, nil
+	for _, path := range []string{
+		filepath.Join(home, ".config", "systemd", "user", "sockets.target.wants", "podman.socket"),
+		"/etc/systemd/user/sockets.target.wants/podman.socket",
+	} {
+		if fileExists(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkAgeIdentity(report *Report, _ Deps) {
+	var paths []string
+	for _, name := range []string{"SOPS_AGE_KEY_FILE", "SOPS_AGE_SSH_PRIVATE_KEY_FILE"} {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			paths = append(paths, value)
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".config", "sops", "age", "keys.txt"))
+	}
+	seen := map[string]bool{}
+	var bad []string
+	found := false
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		found = true
+		if info.Mode().Perm()&0o077 != 0 {
+			bad = append(bad, fmt.Sprintf("%s is mode %04o", path, info.Mode().Perm()))
+		}
+	}
+	if !found {
+		return
+	}
+	if len(bad) > 0 {
+		report.add("age identity", Fail, strings.Join(bad, "; "), "chmod 600 <identity file>")
+		return
+	}
+	report.add("age identity", OK, "SOPS identity files are not group/world readable", "")
+}
+
+func checkSecretPermissions(report *Report, cfg *config.Config) {
+	// A protected state parent makes readable children harmless (the native
+	// NixOS path keeps /var/lib/celine at 0700).
+	stateProtected := false
+	if info, err := os.Stat(cfg.Resolved.StateDir); err == nil && info.Mode().Perm()&0o077 == 0 {
+		stateProtected = true
+	}
+	var managed []string
+	if !stateProtected {
+		if info, err := os.Stat(cfg.Resolved.KavitaConfigDir); err == nil && info.Mode().Perm()&0o077 != 0 {
+			managed = append(managed, fmt.Sprintf("%s is mode %04o", cfg.Resolved.KavitaConfigDir, info.Mode().Perm()))
+		}
+		if info, err := os.Stat(filepath.Join(cfg.Resolved.KavitaConfigDir, "appsettings.json")); err == nil && info.Mode().Perm()&0o077 != 0 {
+			managed = append(managed, fmt.Sprintf("%s is mode %04o", filepath.Join(cfg.Resolved.KavitaConfigDir, "appsettings.json"), info.Mode().Perm()))
+		}
+		if info, err := os.Stat(cfg.Resolved.CalibreConfigDir); err == nil && info.Mode().Perm()&0o077 != 0 {
+			managed = append(managed, fmt.Sprintf("%s is mode %04o", cfg.Resolved.CalibreConfigDir, info.Mode().Perm()))
+		}
+	}
+	if len(managed) > 0 {
+		report.add("state permissions", Fail, strings.Join(managed, "; "), "run `celine up` to reset managed state modes")
+	}
+
+	var legacy []string
+	for _, path := range []string{
+		filepath.Join(cfg.Root, "config"),
+		filepath.Join(cfg.Root, "config.backup"),
+		filepath.Join(cfg.Root, "config", "appsettings.json"),
+		filepath.Join(cfg.Root, "config.backup", "appsettings.json"),
+	} {
+		if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+			legacy = append(legacy, fmt.Sprintf("%s is mode %04o", path, info.Mode().Perm()))
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(cfg.Resolved.BackupDir, "*.tar.gz")); err == nil {
+		for _, path := range matches {
+			base := filepath.Base(path)
+			if !strings.HasPrefix(base, "celine-") && !strings.HasPrefix(base, "legacy-config-") && !strings.HasPrefix(base, "kavita_config_") {
+				continue
+			}
+			if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+				legacy = append(legacy, fmt.Sprintf("%s is mode %04o", path, info.Mode().Perm()))
+			}
+		}
+	}
+	if len(legacy) > 0 {
+		report.add("legacy permissions", Warn, strings.Join(legacy, "; "), "chmod -R go-rwx config config.backup && chmod 600 backups/*.tar.gz")
+	}
 }
 
 type mountInfo struct {
@@ -435,28 +666,4 @@ func humanBytes(bytes uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func latestArchive(dir string) (string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", err
-	}
-	var newest string
-	var newestTime time.Time
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "celine-") || !strings.HasSuffix(name, ".tar.gz") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(newestTime) {
-			newest = filepath.Join(dir, name)
-			newestTime = info.ModTime()
-		}
-	}
-	return newest, nil
 }

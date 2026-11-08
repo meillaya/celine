@@ -45,20 +45,21 @@ Both containers publish on host loopback addresses. Tailscale Serve is the only 
 1. Find `celine.toml` (walk up from the working directory, or use `--config` or `--root`) and load it. `--secretspec` overrides the manifest path. Unknown keys are rejected.
 2. Validate the declaration and the media paths: every Calibre library has a readable `metadata.db`, the Kavita media root exists, and ports and tailnet targets obey the rules in [configuration.md](configuration.md).
 3. Warn when `DOCKER_HOST` is unset. Rootless Podman needs `DOCKER_HOST=unix:///run/user/<uid>/podman/podman.sock`.
-4. Create the state directories and set `state/kavita/config` to mode 0700.
-5. Resolve `KAVITA_TOKEN_KEY`. An environment variable with that name short-circuits SecretSpec; otherwise the CLI runs `secretspec export` against the SOPS provider.
-6. Render `state/kavita/config/appsettings.json` from the deployment settings and the resolved key, preserving keys it does not manage. Write the file atomically with mode 0600.
+4. Create the state directories and set `state/kavita/config` and `state/calibre` to mode 0700.
+5. Resolve `KAVITA_TOKEN_KEY`. An environment variable with that name short-circuits SecretSpec and is announced on stderr; otherwise the CLI runs `secretspec export` against the SOPS provider.
+6. Render `state/kavita/config/appsettings.json` from the deployment settings and the resolved key, preserving keys it does not manage. Write the file atomically with mode 0600. If the file changed and Kavita is already running, restart Kavita after Compose starts so the process actually reads the new settings.
 7. Render `build/compose.yaml` from `celine.toml` and the current uid/gid.
-8. Verify the container runtime, build the Calibre image when it is missing or `--build` is set, pull the Kavita image when it is missing, then run `docker compose up -d --remove-orphans`.
+8. Verify the container runtime, build the Calibre image when it is missing or `--build` is set, pull the Kavita image when it is missing or `--pull` is set, then run `docker compose up -d --remove-orphans`.
 9. Wait up to 180 seconds for both loopback health endpoints. Then apply Tailscale Serve unless `--no-tailnet` is set, and print the URLs. A Tailscale failure produces a warning and the local URLs; the containers stay up.
 
 Other flows:
 
 - `celine render` renders `build/compose.yaml` without the filesystem checks. `--check` compares the rendered bytes with the existing file and exits 1 on drift, which is the drift test used by `devenv` and agents.
-- `celine status` loads and validates the declaration, probes both loopback ports, reads `tailscale status --json` and `tailscale serve status --json`, finds the newest backup, and asks the runtime for its version. `--json` prints the same report as machine-readable JSON.
-- `celine backup` reads the Kavita inventory, runs an SQLite integrity check, takes an online `.backup` of the database, collects settings and bookmarks and the Calibre config, writes a manifest, and prunes old archives. See [operations.md](operations.md).
-- `celine migrate` imports the legacy configuration and signing key. See [migration.md](migration.md).
-- `celine doctor` runs the read-only checks documented in [operations.md](operations.md).
+- `celine status` loads and validates the declaration, probes both loopback ports, reads `tailscale status --json` and `tailscale serve status --json`, finds the newest backup, and asks the runtime for its version. `--json` prints the same report as machine-readable JSON, including an `ok` field. `--strict` exits 1 when a service is down or tailnet state is unavailable.
+- `celine backup` reads the Kavita inventory, runs an SQLite integrity check, takes an online `.backup`, deletes staged WAL/SHM sidecars, redacts known secrets from `appsettings.json`, collects bookmarks and the Calibre config, hashes every file, writes a manifest, verifies the finished archive, and prunes old archives while keeping the new one. See [operations.md](operations.md).
+- `celine restore` verifies an archive before writing, stops live services, takes a pre-restore backup that does not prune the source, removes stale database sidecars, installs the database through a temporary file, and verifies the result. See [operations.md](operations.md).
+- `celine migrate` preflights and stages before archiving or importing the signing key, and installs state only after those steps succeed. See [migration.md](migration.md).
+- `celine doctor` runs the read-only checks documented in [operations.md](operations.md), including boot/linger, secret modes, compose drift, and backup integrity.
 
 ## Path contract
 
@@ -103,11 +104,12 @@ Validation requires host loopback ports to be 1024 or higher, so rootless Podman
 
 1. [secretspec.toml](../secretspec.toml) declares `KAVITA_TOKEN_KEY` with `type = "base64"` and `generate = { bytes = 64 }`. It maps the project to the provider alias `celine_secrets = "sops://secrets/celine.enc.yaml"`.
 2. [.sops.yaml](../.sops.yaml) lists the age recipients and the creation rule for `secrets/celine.enc.yaml`. SOPS decrypts with an age identity available on the host.
-3. `celine up` resolves the value through `secretspec export --format json`. The resolver checks the environment first, which supports tests and CI; a production start should rely on the SOPS store.
-4. The value and the Kavita settings are written to `state/kavita/config/appsettings.json` with mode 0600. `celine up` rewrites this file on every start. Keys that `celine` does not manage are preserved, including `OpenIdConnectSettings`.
+3. `celine up` resolves the value through `secretspec export --format json`. The resolver checks the environment first, which supports tests and CI; a production start should rely on the SOPS store, and the CLI warns when the environment override is used.
+4. The value and the Kavita settings are written to `state/kavita/config/appsettings.json` with mode 0600. `celine up` writes this file when it changed and restarts Kavita if the running process predates the file. Keys that `celine` does not manage are preserved, including `OpenIdConnectSettings`.
 5. `build/compose.yaml` never contains secret values. It carries the environment flags (`PUID`, `PGID`, `TZ`) and the bind mounts only.
-6. The NixOS module runs `celine secrets materialize --name KAVITA_TOKEN_KEY --out <stateDir>/secrets/kavita-token` and wires the file into `services.kavita.credentials.token_key`.
-7. Changing the key invalidates Kavita sessions. `celine migrate` imports the legacy key so sessions survive the move from the legacy deployment.
+6. Backups omit `TokenKey` and known nested secret values. `celine up` re-renders the signing key from SecretSpec after a restore; other secrets such as an OIDC client secret must be re-entered. Archives are mode 0600 but not encrypted.
+7. The NixOS module runs `celine secrets materialize --name KAVITA_TOKEN_KEY --out <stateDir>/secrets/kavita-token` and wires the file into `services.kavita.credentials.token_key`. The module requires an explicit age identity option when it materializes the token.
+8. Changing the key invalidates Kavita sessions. `celine migrate` compares or imports the legacy key so sessions survive the move from the legacy deployment.
 
 ## Why Tailscale uses two HTTPS ports
 
@@ -130,7 +132,7 @@ tailscale serve --bg --yes --https=8443 http://127.0.0.1:18080
 - Container healthchecks use the internal ports. `celine up` additionally probes the host loopback ports, so a published port or proxy problem fails the start.
 - Container logs use the `json-file` driver with `max-size=10m` and `max-file=3`.
 - `runtime.rootless = false` targets a rootful Docker daemon. It sets `user: <uid>:<gid>` on Calibre and passes the host uid/gid as `PUID`/`PGID` to Kavita. File ownership on the bind mounts then follows those ids.
-- `systemctl --user status podman.socket` shows whether the socket is available. The rendered `celine.service` is installed as a system unit with `User=<caller>` so it starts at boot without a login session; it imports `DOCKER_HOST` from the render environment, falling back to the rootless Podman socket when the runtime is rootless.
+- `systemctl --user status podman.socket` shows whether the socket is available. The rendered `celine.service` is installed as a system unit with `User=<caller>`; it waits for `user@<uid>.service` and the Podman socket, imports `DOCKER_HOST` and `XDG_RUNTIME_DIR`, and requires user lingering. `scripts/install-boot.sh --enable-linger --enable-podman` sets up both prerequisites. Without lingering the user manager is not running at boot, so the rootless socket would not exist until login.
 
 ## Reproducibility and state
 
@@ -156,6 +158,6 @@ The NixOS path uses the same declaration inside a NixOS configuration. The modul
 
 ## Validation status
 
-Verified live on this host on 2026-11-07: `celine migrate --yes`, `celine up --build`, `celine tailnet apply`, `celine status`, `celine status --json`, `celine doctor --strict` (25 ok, 0 warn, 0 fail), `celine backup`, `celine restore` into a separate `--state-dir` copy, and `celine render --check`. Both tailnet URLs answer 200 with a Let's Encrypt certificate.
+Verified live on this host on 2026-11-07: `celine migrate --yes`, `celine up --build`, `celine tailnet apply`, `celine status`, `celine status --json`, `celine doctor --strict` (all checks ok at that time), `celine backup`, `celine restore` into a separate `--state-dir` copy, and `celine render --check`. Both tailnet URLs answer 200 with a Let's Encrypt certificate. The 2026-11-08 remediation adds verified/redacted archives, verified restore, `status --strict`, `doctor --expect-running`, boot/linger/permission checks, and the rootless boot-unit prerequisites; the live re-run is recorded in the repository history.
 
 Not exercised in this environment: `celine restore` against live state, `scripts/install-boot.sh` installation (requires root; its `--dry-run` path runs in CI), rootful container runtime behavior, and a NixOS host deployment (the module is evaluated by `nix flake check`).

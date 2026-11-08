@@ -56,6 +56,8 @@ func TestComposeContainsBothServicesAndNoSecrets(t *testing.T) {
 		"/repo/state/kavita/config:/config",
 		"PUID: \"0\"",
 		"PGID: \"0\"",
+		"stop_grace_period: 15s",
+		"stop_grace_period: 30s",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("compose missing %q:\n%s", want, text)
@@ -117,6 +119,21 @@ func TestAppSettingsNativeBindsLoopback(t *testing.T) {
 	}
 }
 
+func TestAppSettingsNullDoesNotPanic(t *testing.T) {
+	cfg := testConfig(t)
+	out, err := AppSettings(cfg, "token", []byte("null"), TargetDocker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["TokenKey"] != "token" {
+		t.Fatalf("token = %v", decoded["TokenKey"])
+	}
+}
+
 func TestTailnetEndpoints(t *testing.T) {
 	cfg := testConfig(t)
 	endpoints, err := Endpoints(cfg, "node.example.ts.net")
@@ -136,25 +153,36 @@ func TestTailnetEndpoints(t *testing.T) {
 
 func TestSystemdUnits(t *testing.T) {
 	units, err := SystemdUnits(SystemdOptions{
-		CelineBin:  "/nix/store/celine/bin/celine",
-		ConfigPath: "/repo/celine.toml",
-		User:       "mei",
-		Group:      "users",
-		Home:       "/home/mei",
-		DockerHost: "unix:///run/user/1000/podman/podman.sock",
-		MediaRoot:  "/media",
-		OnCalendar: "daily",
-		PathEnv:    "/home/mei/.nix-profile/bin:/usr/bin:/bin",
+		CelineBin:     "/nix/store/celine/bin/celine",
+		ConfigPath:    "/repo/celine.toml",
+		User:          "mei",
+		Group:         "users",
+		Home:          "/home/mei",
+		DockerHost:    "unix:///run/user/1000/podman/podman.sock",
+		MediaRoot:     "/media",
+		StateDir:      "/repo/state",
+		BackupDir:     "/repo/backups",
+		OnCalendar:    "daily",
+		PathEnv:       "/home/mei/.nix-profile/bin:/usr/bin:/bin",
+		Rootless:      true,
+		UID:           1000,
+		BackupEnabled: true,
+		ExtraEnv: map[string]string{
+			"SOPS_AGE_KEY_FILE": "/home/mei/.config/sops/age/keys.txt",
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	service := units["celine.service"]
 	for _, want := range []string{
-		"RequiresMountsFor=/media",
+		"RequiresMountsFor=/media /repo/state /repo/backups",
 		"User=mei",
+		"After=network-online.target tailscaled.service user@1000.service",
 		"Environment=DOCKER_HOST=unix:///run/user/1000/podman/podman.sock",
 		"Environment=PATH=/home/mei/.nix-profile/bin:/usr/bin:/bin",
+		"Environment=XDG_RUNTIME_DIR=/run/user/1000",
+		"Environment=SOPS_AGE_KEY_FILE=/home/mei/.config/sops/age/keys.txt",
 		"ExecStart=/nix/store/celine/bin/celine up --config /repo/celine.toml",
 		"WantedBy=multi-user.target",
 	} {
@@ -162,7 +190,54 @@ func TestSystemdUnits(t *testing.T) {
 			t.Errorf("service missing %q:\n%s", want, service)
 		}
 	}
+	if !strings.Contains(service, "ExecStartPre=/bin/sh") {
+		t.Errorf("rootless service has no podman socket wait:\n%s", service)
+	}
 	if !strings.Contains(units["celine-backup.timer"], "OnCalendar=daily") {
 		t.Errorf("timer missing calendar:\n%s", units["celine-backup.timer"])
+	}
+	if !strings.Contains(units["celine-backup.service"], "RequiresMountsFor=/media /repo/state /repo/backups") {
+		t.Errorf("backup service missing mounts:\n%s", units["celine-backup.service"])
+	}
+}
+
+func TestSystemdUnitsSkipsBackupWhenDisabled(t *testing.T) {
+	units, err := SystemdUnits(SystemdOptions{
+		CelineBin:  "/bin/celine",
+		ConfigPath: "/repo/celine.toml",
+		User:       "mei",
+		Group:      "mei",
+		Home:       "/home/mei",
+		MediaRoot:  "/media",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(units) != 1 || units["celine.service"] == "" {
+		t.Fatalf("units = %v", units)
+	}
+}
+
+func TestSystemdUnitsQuotesPathsWithSpaces(t *testing.T) {
+	units, err := SystemdUnits(SystemdOptions{
+		CelineBin:     "/opt/celine bin/celine",
+		ConfigPath:    "/repo with space/celine.toml",
+		User:          "mei",
+		Group:         "mei",
+		Home:          "/home/mei",
+		MediaRoot:     "/media with space",
+		BackupEnabled: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := units["celine.service"]
+	for _, want := range []string{
+		"RequiresMountsFor=\"/media with space\"",
+		"ExecStart=\"/opt/celine bin/celine\" up --config \"/repo with space/celine.toml\"",
+	} {
+		if !strings.Contains(service, want) {
+			t.Errorf("service missing %q:\n%s", want, service)
+		}
 	}
 }

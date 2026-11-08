@@ -98,10 +98,10 @@ func Clear(ctx context.Context, runner execx.Runner, ts string, endpoints []rend
 
 // StatusSummary is a value-free description for doctor and status output.
 type StatusSummary struct {
-	BackendState string
-	DNSName      string
-	CertDomains  []string
-	Serve        string
+	BackendState string   `json:"backend_state"`
+	DNSName      string   `json:"dns_name"`
+	CertDomains  []string `json:"cert_domains"`
+	Serve        string   `json:"serve"`
 }
 
 // ReadStatus gathers the tailnet state.

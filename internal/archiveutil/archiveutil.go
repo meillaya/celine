@@ -16,13 +16,21 @@ import (
 )
 
 // TarGz writes srcDir as a gzip-compressed tar archive. Paths in the archive
-// are relative to srcDir, which becomes the archive root.
-func TarGz(srcDir, dest string) error {
+// are relative to srcDir, which becomes the archive root. Only directories and
+// regular files are archived; symlinks, sockets, devices, and FIFOs are
+// skipped because copying them is either unsafe or can block indefinitely.
+func TarGz(srcDir, dest string) (err error) {
 	file, err := os.Create(dest)
 	if err != nil {
 		return fmt.Errorf("create archive: %w", err)
 	}
-	defer file.Close()
+	success := false
+	defer func() {
+		file.Close()
+		if !success {
+			os.Remove(dest)
+		}
+	}()
 	if err := file.Chmod(0o600); err != nil {
 		return fmt.Errorf("set archive mode: %w", err)
 	}
@@ -45,7 +53,7 @@ func TarGz(srcDir, dest string) error {
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if !entry.IsDir() && !info.Mode().IsRegular() {
 			return nil
 		}
 		header, err := tar.FileInfoHeader(info, "")
@@ -77,8 +85,6 @@ func TarGz(srcDir, dest string) error {
 	if err != nil {
 		tw.Close()
 		gz.Close()
-		file.Close()
-		os.Remove(dest)
 		return fmt.Errorf("write archive: %w", err)
 	}
 	if err := tw.Close(); err != nil {
@@ -90,7 +96,11 @@ func TarGz(srcDir, dest string) error {
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync archive: %w", err)
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close archive: %w", err)
+	}
+	success = true
+	return nil
 }
 
 // ExtractTarGz extracts an archive into dest, rejecting absolute paths and
@@ -202,7 +212,7 @@ func CopyTree(srcDir, dstDir string, skip func(rel string) bool) error {
 		if entry.IsDir() {
 			return os.MkdirAll(target, info.Mode().Perm())
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if !info.Mode().IsRegular() {
 			return nil
 		}
 		return CopyFile(path, target, info.Mode().Perm())
@@ -224,9 +234,13 @@ func CopyFile(src, dst string, mode os.FileMode) error {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
 	_, copyErr := io.Copy(out, in)
+	syncErr := out.Sync()
 	closeErr := out.Close()
 	if copyErr != nil {
 		return fmt.Errorf("copy %s: %w", src, copyErr)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("sync %s: %w", dst, syncErr)
 	}
 	return closeErr
 }
@@ -253,6 +267,13 @@ func FilesUnder(dir string) ([]string, error) {
 			return walkErr
 		}
 		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
 			return nil
 		}
 		rel, err := filepath.Rel(dir, path)

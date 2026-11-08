@@ -21,5 +21,6 @@
     root = ../.;
     stateDir = "/var/lib/celine";
     mediaRoot = "/srv/celine";
+    secretspec.sopsAgeKeyFile = "/run/secrets/celine-age.key";
   };
 }

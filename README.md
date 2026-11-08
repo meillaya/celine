@@ -74,31 +74,32 @@ Run these steps from the repository root with the media drive mounted and `tails
    - Kavita: https://massive-1.tailf8e61e.ts.net/
    - Calibre: https://massive-1.tailf8e61e.ts.net:8443/
 
-7. Install the boot units once. The script renders the units with your uid, `DOCKER_HOST`, and a stable tool `PATH`, then uses `sudo` for `/etc/systemd/system` and `systemctl`. It refuses to run as root and builds `build/celine` with Go if no binary is available.
+7. Install the boot units once. The script renders the units with your uid, `DOCKER_HOST`, SOPS/SecretSpec environment, and a stable tool `PATH`, then uses `sudo` for `/etc/systemd/system` and `systemctl`. It refuses to run as root and builds `build/celine` with Go if no binary is available. Rootless Podman also needs user lingering and the user `podman.socket`; `--enable-linger` and `--enable-podman` do both.
 
    ```bash
-   scripts/install-boot.sh
-   scripts/install-boot.sh --dry-run   # print the actions first
+   scripts/install-boot.sh --dry-run
+   scripts/install-boot.sh --enable-linger --enable-podman
    ```
 
-This host is already deployed: `state/`, `secrets/celine.enc.yaml`, and `backups/` exist. Do not rerun `celine migrate` without `--force`. Run `celine up` to converge configuration changes.
+This host is already deployed: `state/`, `secrets/celine.enc.yaml`, and `backups/` exist. Do not rerun `celine migrate` without `--force`, and run `celine doctor --strict --expect-running` after boot changes to see whether units, lingering, secret modes, and the backup timer are actually healthy. Run `celine up` to converge configuration changes.
 
 ## Daily commands
 
 | Task | Command |
 | --- | --- |
-| Show health, URLs, and runtime | `celine status` |
-| Print the same report as JSON | `celine status --json` |
-| Run preflight and health checks | `celine doctor --strict` |
+| Show a machine-readable health report | `celine status --json` |
+| Fail automation when a service is down | `celine status --strict` |
+| Run preflight and health checks | `celine doctor --strict --expect-running` |
 | Follow Kavita logs | `celine logs -f kavita` |
 | Start or stop the containers | `celine up`, `celine down` |
+| Refresh a re-pushed Kavita tag | `celine up --pull` |
 | Install or remove boot units | `scripts/install-boot.sh`, `scripts/install-boot.sh --uninstall` |
 | Apply or remove Tailscale Serve | `celine tailnet apply`, `celine tailnet down` |
 | Archive state now | `celine backup` |
-| Restore an archive | `celine restore backups/<archive> --yes` |
+| Restore an archive | `celine restore backups/<archive> --dry-run`, then `--yes` |
 | Print the version | `celine version` |
 
-`celine down` stops the containers and leaves Tailscale Serve handlers in place, so the URLs return 502 until the next `celine up`. Use `celine tailnet down` to remove the handlers.
+`celine doctor` without `--expect-running` is a preflight check: a free port is reported as a service that has not started yet. Use `--expect-running` (or `celine status --strict`) when the stack is supposed to be up. `celine down` stops the containers and leaves Tailscale Serve handlers in place, so the URLs return 502 until the next `celine up`. Use `celine tailnet down` to remove the handlers.
 
 ## Configuration
 
@@ -128,7 +129,7 @@ services.celine = {
 };
 ```
 
-Keep the default `root`. It points at the Celine flake source, which Nix filters to the tracked files. Setting `root` to a local path literal such as `/run/media/mei/Kingston/celine` copies that directory into the Nix store, including `data/` and `state/` with tens of gigabytes of media. When the flake input path must be explicit, use `root = inputs.celine.outPath;`. `mediaRoot` must be the runtime path on the NixOS host. The age identity must be readable by the service; the module sets `SOPS_AGE_KEY_FILE` from `secretspec.sopsAgeKeyFile` and `SOPS_AGE_SSH_PRIVATE_KEY_FILE` from `secretspec.sopsAgeSshPrivateKeyFile`.
+Keep the default `root`. It points at the Celine flake source, which Nix filters to the tracked files. Setting `root` to a local path literal such as `/run/media/mei/Kingston/celine` copies that directory into the Nix store, including `data/` and `state/` with tens of gigabytes of media. When the flake input path must be explicit, use `root = inputs.celine.outPath;`. `mediaRoot` must be the runtime path on the NixOS host. The age identity must be readable by the service; the module sets `SOPS_AGE_KEY_FILE` from `secretspec.sopsAgeKeyFile` and `SOPS_AGE_SSH_PRIVATE_KEY_FILE` from `secretspec.sopsAgeSshPrivateKeyFile`. When SecretSpec materializes the token, one of those two options is required; a unit that runs outside your login session cannot fall back to an interactive default identity. `services.celine.backup.enable` defaults to `[backup].enable` in `celine.toml`, and the secret/backup units require the state and backup mounts before they run.
 
 The module has been evaluated with `nix flake check`. A NixOS host has not been deployed from this repository. Use the Podman path and the NixOS module on separate hosts, because both own the same host ports and Tailscale HTTPS ports.
 
@@ -144,9 +145,11 @@ celine secrets materialize --name KAVITA_TOKEN_KEY --out /var/lib/celine/secrets
 
 ## Backups and restore
 
-`celine backup` takes an online SQLite backup of the Kavita database, then archives the database, `appsettings.json`, bookmarks, and the Calibre server configuration into `backups/celine-<UTC timestamp>.tar.gz`. It skips Kavita covers and caches, logs, and all media. Retention defaults to 10 archives; `celine backup --retention N` overrides the configured count for one run.
+`celine backup` takes an online SQLite backup of the Kavita database, then archives the database, a redacted `appsettings.json`, bookmarks, and the Calibre server configuration into `backups/celine-<UTC timestamp>.tar.gz`. It skips Kavita covers, caches, themes, fonts, templates, favicons, images, logs, internal backups, and all media. The archive contains a manifest with the tool version, timestamp, configuration SHA-256, Kavita inventory, every archived file's SHA-256, and the exclusion list. `celine backup` reads the archive back and verifies the manifest, hashes, database integrity, and inventory before reporting success. Retention defaults to 10 archives; `celine backup --retention N` overrides the configured count for one run.
 
-`celine restore backups/<archive> --yes` verifies the archive, stops the services, takes a pre-restore backup, and writes the archived state back. `--yes` confirms the destructive action. `--force` is accepted for compatibility and is only relevant when restoring into a state directory chosen with `--state-dir`. Run `celine up` afterward. [docs/migration.md](docs/migration.md) covers restore and database-upgrade recovery; [docs/operations.md](docs/operations.md) covers routine backup and restore.
+The Kavita signing key (`TokenKey`) and known nested secret keys (for example `OpenIdConnectSettings.Secret`) are removed before archiving. `celine up` re-renders the signing key from SecretSpec after a restore; OIDC client secrets must be re-entered. Archives are mode 0600 but are **not encrypted**: they contain user data and Calibre account state. Store them on trusted media and copy them offsite separately.
+
+`celine restore backups/<archive> --dry-run` verifies the archive, hashes, database integrity, and inventory without writing. `celine restore backups/<archive> --yes` verifies again, stops the configured services, takes a pre-restore backup, removes stale SQLite `-wal`/`-shm` sidecars, installs the database through a temporary file, and checks the restored database before telling you to run `celine up`. It refuses to write over live state if the services cannot be stopped or if the pre-restore backup fails. The `--force` flag is accepted for compatibility, but `--yes` is the destructive confirmation. See [docs/migration.md](docs/migration.md) for recovery paths and [docs/operations.md](docs/operations.md) for routine operations.
 
 ## Security model
 
@@ -154,14 +157,23 @@ celine secrets materialize --name KAVITA_TOKEN_KEY --out /var/lib/celine/secrets
 - Calibre runs without authentication and the CLI does not pass `--enable-local-write`, so the HTTP surface is read-only. Access control is the tailnet ACL.
 - Kavita enforces its own accounts.
 - Calibre mounts media read-write because the server creates a temporary case-sensitivity probe file in each library root on first access; a read-only mount breaks OPDS with an `OSError`. The HTTP surface stays read-only.
-- Secrets stay encrypted at rest. The `appsettings.json` file has mode 0600, the `state/kavita/config` directory has mode 0700, and rendered Compose contains no secret values.
+- The SOPS store is encrypted at rest and `secrets/` is mode 0700. The age private identity must be mode 0600; `celine doctor` fails when it is group/world readable.
+- `celine up` writes `state/kavita/config/appsettings.json` with mode 0600 and keeps the config directory at 0700. It also sets the Calibre state directory to 0700. `celine doctor` reports managed state that is group/world readable.
+- New backup archives are mode 0600 and redact the signing key and known nested secret keys, but they are not encrypted. Treat `backups/` as sensitive state.
+- Legacy rollback copies are plaintext: `config/`, `config.backup/`, the old `kavita_config_*.tar.gz` archives, and any Celine archive created before this redaction change contain the legacy signing key. Run `chmod -R go-rwx config config.backup` and `chmod 600 backups/*.tar.gz` after you no longer need the rollback path. `celine doctor` warns about group/world-readable legacy copies, and `celine restore --dry-run` warns when an archive still contains plaintext secret values; delete pre-redaction archives after a new verified backup.
+- `celine up` warns on stderr when `KAVITA_TOKEN_KEY` is supplied from the environment, because that bypasses the SOPS store. Environment overrides exist for tests and CI; normal operation should use the store.
 
 ## Troubleshooting
 
 | Symptom | First check |
 | --- | --- |
 | `container runtime is not reachable` | Export `DOCKER_HOST=unix:///run/user/1000/podman/podman.sock`; check `systemctl --user status podman.socket` |
-| Doctor reports a Kavita database failure | Run `celine migrate --yes`, or start Kavita once |
+| Doctor reports a Kavita database failure | Run `celine migrate --yes`, or restore the newest archive |
+| Doctor reports `boot units` or `boot linger` | Run `scripts/install-boot.sh --enable-linger --enable-podman` |
+| Doctor reports `age identity` mode | `chmod 600 ~/.config/sops/age/keys.txt` (or the path in `SOPS_AGE_KEY_FILE`) |
+| Doctor reports legacy permissions | `chmod -R go-rwx config config.backup; chmod 600 backups/*.tar.gz` after the rollback window |
+| Doctor reports `backup timer` | Run `scripts/install-boot.sh`, then `systemctl list-timers celine-backup.timer` |
+| Doctor reports `backup integrity` | Keep the old archive, run `celine backup`, and verify the new one with `celine restore --dry-run` |
 | Tailscale Serve is not applied | Run `celine tailnet apply`; check `tailscale status` and HTTPS certificates for the tailnet |
 | Secrets do not resolve | Run `secretspec --file secretspec.toml check`; unlock the age identity |
 | A service is not healthy | Run `celine logs <service>`; check the port in `celine.toml` |
@@ -171,7 +183,7 @@ celine secrets materialize --name KAVITA_TOKEN_KEY --out /var/lib/celine/secrets
 
 ## Migration and rollback
 
-`celine migrate --yes` copies `config/` into `state/kavita/config` with an integrity check, writes a legacy archive under `backups/`, imports the signing key into the SOPS store, and records `state/.migration.json`. It never edits `config/`, so the legacy configuration remains available for rollback. [docs/migration.md](docs/migration.md) gives the exact steps, the signing-key behavior, and database-upgrade recovery.
+`celine migrate --yes` copies `config/` into `state/kavita/config` with an integrity check, writes a legacy archive under `backups/`, imports the signing key into the SOPS store, and records `state/.migration.json`. It never edits `config/`, so the legacy configuration remains available for rollback. The migration preflights the target before writing, stages and verifies the database, imports the signing key before replacing live state, compares an existing SOPS store instead of claiming an import it did not perform, and refuses to replace state under a running stack unless you pass `--stop-services`. [docs/migration.md](docs/migration.md) gives the exact steps, the signing-key behavior, and database-upgrade recovery.
 
 ## Documentation
 

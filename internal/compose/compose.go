@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/Meillaya/celine/internal/execx"
 )
@@ -52,6 +53,51 @@ func (c *Client) Up(ctx context.Context) error {
 func (c *Client) Down(ctx context.Context) error {
 	_, err := c.run(ctx, "down", "--remove-orphans")
 	return err
+}
+
+// Restart restarts the named services. It is used when a bind-mounted
+// configuration file changed but the Compose document did not, so Compose
+// would otherwise leave the old process running.
+func (c *Client) Restart(ctx context.Context, services ...string) error {
+	args := append([]string{"restart"}, services...)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// Running reports whether the Compose project has any running containers.
+func (c *Client) Running(ctx context.Context) (bool, error) {
+	result, err := c.run(ctx, "ps", "-q")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(result.Stdout)) != "", nil
+}
+
+// StartedAt returns the start time of one service's container. It is false when
+// the service has no container yet.
+func (c *Client) StartedAt(ctx context.Context, service string) (time.Time, bool, error) {
+	result, err := c.run(ctx, "ps", "-q", service)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	id := strings.TrimSpace(string(result.Stdout))
+	if id == "" {
+		return time.Time{}, false, nil
+	}
+	// -q can return more than one container if a previous generation is still
+	// present; use the newest line.
+	lines := strings.Split(id, "\n")
+	id = strings.TrimSpace(lines[len(lines)-1])
+	inspect, err := c.Runner.Run(ctx, c.Docker, []string{"inspect", "--format", "{{.State.StartedAt}}", id}, execx.Options{})
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	value := strings.TrimSpace(string(inspect.Stdout))
+	started, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse container start time %q: %w", value, err)
+	}
+	return started, true, nil
 }
 
 // Build builds the named services.

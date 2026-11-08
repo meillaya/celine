@@ -9,18 +9,16 @@
 set -euo pipefail
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-UNIT_DIR="$ROOT/build/systemd"
 SYSTEM_DIR="${CELINE_SYSTEMD_DIR:-/etc/systemd/system}"
 CELINE_BIN="${CELINE_BIN:-}"
 CONFIG=""
 MODE="install"
 DRY_RUN=0
-
-UNIT_FILES=(
-  "celine.service"
-  "celine-backup.service"
-  "celine-backup.timer"
-)
+ENABLE_LINGER=0
+ENABLE_PODMAN=0
+UNIT_DIR=""
+UNIT_FILES=()
+ENABLE_UNITS=()
 
 usage() {
   cat <<'EOF'
@@ -30,8 +28,10 @@ Install, enable, or remove the Celine systemd units on a rootless Podman host.
 Run as the operator account, not as root; the script calls sudo internally.
 
 Options:
-  --dry-run          Render the units and print the install commands, write nothing
+  --dry-run          Render into a temporary directory and print the actions
   --uninstall        Disable and remove the installed units
+  --enable-linger    Enable systemd user lingering (sudo loginctl enable-linger)
+  --enable-podman    Enable the rootless podman.socket user unit
   --celine PATH      Path to the celine binary (default: build/celine, result/bin/celine, PATH;
                      when missing, the script builds build/celine with go if available)
   --config PATH      Path to celine.toml (default: discovered next to the repository)
@@ -40,6 +40,7 @@ Options:
 Environment:
   CELINE_BIN         Same as --celine
   CELINE_SYSTEMD_DIR Install target (default: /etc/systemd/system)
+  DOCKER_HOST        Rootless Podman socket, for example unix:///run/user/1000/podman/podman.sock
 EOF
 }
 
@@ -55,6 +56,17 @@ run() {
   fi
 }
 
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+cleanup() {
+  if [ -n "$UNIT_DIR" ] && [ -d "$UNIT_DIR" ]; then
+    rm -rf -- "$UNIT_DIR"
+  fi
+}
+trap cleanup EXIT
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)
@@ -63,6 +75,14 @@ while [ $# -gt 0 ]; do
       ;;
     --uninstall)
       MODE="uninstall"
+      shift
+      ;;
+    --enable-linger)
+      ENABLE_LINGER=1
+      shift
+      ;;
+    --enable-podman)
+      ENABLE_PODMAN=1
       shift
       ;;
     --celine)
@@ -136,11 +156,14 @@ CELINE_BIN=$(readlink -f -- "$(choose_celine)")
 
 if [ "$MODE" = "uninstall" ]; then
   printf 'Removing Celine boot units from %s\n' "$SYSTEM_DIR"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    sudo -v
+  fi
   # Disable boot startup without stopping the running stack. Stopping
   # celine.service would run its ExecStop and stop the containers.
   run sudo systemctl disable celine.service celine-backup.timer || true
   run sudo systemctl stop celine-backup.timer || true
-  for unit in "${UNIT_FILES[@]}"; do
+  for unit in celine.service celine-backup.service celine-backup.timer; do
     run sudo rm -f -- "$SYSTEM_DIR/$unit"
   done
   run sudo systemctl daemon-reload
@@ -150,14 +173,72 @@ if [ "$MODE" = "uninstall" ]; then
 fi
 
 printf 'Rendering units with %s\n' "$CELINE_BIN"
-mkdir -p "$UNIT_DIR"
+UNIT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/celine-units.XXXXXX")
 (cd "$ROOT" && "$CELINE_BIN" systemd render --out "$UNIT_DIR" --celine "$CELINE_BIN" "${CONFIG_ARGS[@]}")
-for unit in "${UNIT_FILES[@]}"; do
-  [ -f "$UNIT_DIR/$unit" ] || fail "render did not produce $UNIT_DIR/$unit"
+
+for unit in celine.service celine-backup.service celine-backup.timer; do
+  if [ -f "$UNIT_DIR/$unit" ]; then
+    UNIT_FILES+=("$unit")
+  fi
 done
+[ -f "$UNIT_DIR/celine.service" ] || fail "render did not produce celine.service"
+ENABLE_UNITS=(celine.service)
+if [ -f "$UNIT_DIR/celine-backup.timer" ]; then
+  ENABLE_UNITS+=(celine-backup.timer)
+fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
   sudo -v
+fi
+
+check_prereqs() {
+  local operator
+  operator=$(id -un)
+  if command -v loginctl >/dev/null 2>&1; then
+    local linger
+    linger=$(loginctl show-user "$operator" -p Linger 2>/dev/null || true)
+    case "$linger" in
+      *Linger=yes*)
+        printf '  linger: enabled for %s\n' "$operator"
+        ;;
+      *)
+        warn "user lingering is disabled; a system unit cannot reach the rootless Podman socket before login"
+        if [ "$ENABLE_LINGER" -eq 1 ]; then
+          run sudo loginctl enable-linger "$operator"
+        else
+          printf '  fix: sudo loginctl enable-linger %s (or rerun with --enable-linger)\n' "$operator"
+        fi
+        ;;
+    esac
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user is-enabled podman.socket >/dev/null 2>&1; then
+    printf '  podman.socket: enabled for %s\n' "$operator"
+  else
+    warn "podman.socket is not enabled in the user manager"
+    if [ "$ENABLE_PODMAN" -eq 1 ]; then
+      run systemctl --user enable --now podman.socket
+    else
+      printf '  fix: systemctl --user enable --now podman.socket (or rerun with --enable-podman)\n'
+    fi
+  fi
+
+  if [ -n "${DOCKER_HOST:-}" ] && [[ "${DOCKER_HOST}" == unix://* ]]; then
+    local socket="${DOCKER_HOST#unix://}"
+    if [ ! -S "$socket" ]; then
+      warn "DOCKER_HOST socket $socket does not exist yet; start podman.socket before the service"
+    fi
+  fi
+}
+
+printf '\nChecking rootless prerequisites\n'
+check_prereqs
+
+if [ ! -f "$UNIT_DIR/celine-backup.timer" ]; then
+  # backup.enable is false: remove units left by an earlier install instead of
+  # leaving an enabled timer that points at a unit this render no longer owns.
+  run sudo systemctl disable --now celine-backup.timer || true
+  run sudo rm -f -- "$SYSTEM_DIR/celine-backup.service" "$SYSTEM_DIR/celine-backup.timer"
 fi
 
 printf '\nInstalling units into %s\n' "$SYSTEM_DIR"
@@ -166,7 +247,7 @@ for unit in "${UNIT_FILES[@]}"; do
   run sudo install -m644 "$UNIT_DIR/$unit" "$SYSTEM_DIR/$unit"
 done
 run sudo systemctl daemon-reload
-run sudo systemctl enable --now celine.service celine-backup.timer
+run sudo systemctl enable --now "${ENABLE_UNITS[@]}"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf '\nDry run complete; nothing was installed.\n'
@@ -174,7 +255,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 printf '\nBoot persistence installed.\n'
-printf '  check:   systemctl status celine.service celine-backup.timer\n'
+printf '  check:   systemctl status celine.service\n'
+if [ -f "$SYSTEM_DIR/celine-backup.timer" ]; then
+  printf '  timer:   systemctl list-timers celine-backup.timer\n'
+fi
 printf '  logs:    journalctl -u celine.service -u celine-backup.service\n'
 printf '  restart: sudo systemctl restart celine.service\n'
+printf '  verify:  %s doctor --strict --expect-running\n' "$CELINE_BIN"
 printf '\nAfter editing paths, units, or DOCKER_HOST, rerun this script and restart celine.service.\n'

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Meillaya/celine/internal/backup"
@@ -53,28 +54,36 @@ func (a App) ensureStateDirs(cfg *config.Config) error {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
-	if err := os.Chmod(cfg.Resolved.KavitaConfigDir, 0o700); err != nil {
-		return fmt.Errorf("secure Kavita config dir: %w", err)
+	for _, dir := range []string{cfg.Resolved.CalibreConfigDir, cfg.Resolved.KavitaConfigDir} {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("secure state directory %s: %w", dir, err)
+		}
 	}
 	return nil
 }
 
-func (a App) writeAppSettings(ctx context.Context, cfg *config.Config, reason string) error {
+func (a App) writeAppSettings(ctx context.Context, cfg *config.Config, reason string) (bool, error) {
 	path := filepath.Join(cfg.Resolved.KavitaConfigDir, "appsettings.json")
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read existing appsettings.json: %w", err)
+		return false, fmt.Errorf("read existing appsettings.json: %w", err)
+	}
+	if value, ok := a.LookupEnv(secrets.NameKavitaTokenKey); ok && strings.TrimSpace(value) != "" {
+		a.errOut("warning: KAVITA_TOKEN_KEY is set in the environment; it overrides the SOPS store for this command")
 	}
 	resolver := a.resolverFor(cfg, reason)
 	values, err := resolver.Resolve(ctx, secrets.NameKavitaTokenKey)
 	if err != nil {
-		return err
+		return false, err
 	}
 	rendered, err := render.AppSettings(cfg, values[secrets.NameKavitaTokenKey], existing, render.TargetDocker)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return writeAtomic(path, rendered, 0o600)
+	if len(existing) > 0 && bytes.Equal(existing, rendered) {
+		return false, nil
+	}
+	return true, writeAtomic(path, rendered, 0o600)
 }
 
 func (a App) waitForServices(ctx context.Context, cfg *config.Config) error {
@@ -147,6 +156,9 @@ func (a App) cmdValidate(args []string) int {
 	if code, done := parseFlags(set, args); done {
 		return code
 	}
+	if code, done := noPositional(set, a); done {
+		return code
+	}
 	cfg, err := common.load(a, !*noFilesystem)
 	if err != nil {
 		return a.fail(err)
@@ -167,6 +179,9 @@ func (a App) cmdRender(args []string) int {
 	check := set.Bool("check", false, "fail when build/compose.yaml differs")
 	outDir := set.String("out", "", "output directory (default: <root>/build)")
 	if code, done := parseFlags(set, args); done {
+		return code
+	}
+	if code, done := noPositional(set, a); done {
 		return code
 	}
 	cfg, err := common.load(a, false)
@@ -203,8 +218,12 @@ func (a App) cmdRender(args []string) int {
 func (a App) cmdUp(args []string) int {
 	set, common := a.newFlagSet("up")
 	build := set.Bool("build", false, "rebuild the Calibre image before starting")
+	pull := set.Bool("pull", false, "pull the Kavita image even when it is already present")
 	noTailnet := set.Bool("no-tailnet", false, "do not apply Tailscale Serve")
 	if code, done := parseFlags(set, args); done {
+		return code
+	}
+	if code, done := noPositional(set, a); done {
 		return code
 	}
 	cfg, err := common.load(a, true)
@@ -220,8 +239,10 @@ func (a App) cmdUp(args []string) int {
 	if err := a.ensureStateDirs(cfg); err != nil {
 		return a.fail(err)
 	}
+	appSettingsChanged := false
 	if cfg.Kavita.Enable {
-		if err := a.writeAppSettings(ctx, cfg, "celine up"); err != nil {
+		appSettingsChanged, err = a.writeAppSettings(ctx, cfg, "celine up")
+		if err != nil {
 			return a.fail(err)
 		}
 	}
@@ -255,7 +276,7 @@ func (a App) cmdUp(args []string) int {
 	}
 	if cfg.Kavita.Enable {
 		exists, err := client.ImageExists(ctx, cfg.Kavita.Image)
-		if err == nil && !exists {
+		if err == nil && (*pull || !exists) {
 			a.out("pulling %s", cfg.Kavita.Image)
 			if err := client.Pull(ctx, "kavita"); err != nil {
 				return a.fail(err)
@@ -266,6 +287,31 @@ func (a App) cmdUp(args []string) int {
 	a.out("starting services")
 	if err := client.Up(ctx); err != nil {
 		return a.fail(err)
+	}
+	if cfg.Kavita.Enable {
+		// appsettings.json is bind-mounted, not part of the Compose document.
+		// Compose therefore leaves the running Kavita process alone when only
+		// the settings file changed (token rotation, OIDC, BaseUrl, ...). Compare
+		// the file mtime to the container start time and restart only when the
+		// running process predates the current settings.
+		appSettings := filepath.Join(cfg.Resolved.KavitaConfigDir, "appsettings.json")
+		if fileInfo, statErr := os.Stat(appSettings); statErr == nil {
+			started, running, startErr := client.StartedAt(ctx, "kavita")
+			switch {
+			case startErr != nil:
+				if appSettingsChanged {
+					a.errOut("warning: could not determine Kavita start time (%v); restarting to apply appsettings.json", startErr)
+					if err := client.Restart(ctx, "kavita"); err != nil {
+						return a.fail(err)
+					}
+				}
+			case running && started.Before(fileInfo.ModTime()):
+				a.out("restarting kavita to apply appsettings.json")
+				if err := client.Restart(ctx, "kavita"); err != nil {
+					return a.fail(err)
+				}
+			}
+		}
 	}
 	if err := a.waitForServices(ctx, cfg); err != nil {
 		return a.fail(err)
@@ -296,6 +342,9 @@ func (a App) cmdDown(args []string) int {
 	if code, done := parseFlags(set, args); done {
 		return code
 	}
+	if code, done := noPositional(set, a); done {
+		return code
+	}
 	cfg, err := common.load(a, false)
 	if err != nil {
 		return a.fail(err)
@@ -317,9 +366,11 @@ type serviceStatus struct {
 
 type statusReport struct {
 	Config         string                 `json:"config"`
+	OK             bool                   `json:"ok"`
 	Services       []serviceStatus        `json:"services"`
 	URLs           []doctor.URL           `json:"urls,omitempty"`
 	Tailnet        *tailnet.StatusSummary `json:"tailnet,omitempty"`
+	TailnetError   string                 `json:"tailnet_error,omitempty"`
 	LatestBackup   string                 `json:"latest_backup,omitempty"`
 	Runtime        string                 `json:"runtime,omitempty"`
 	ComposeVersion string                 `json:"compose_version,omitempty"`
@@ -328,7 +379,11 @@ type statusReport struct {
 func (a App) cmdStatus(args []string) int {
 	set, common := a.newFlagSet("status")
 	asJSON := set.Bool("json", false, "print JSON")
+	strict := set.Bool("strict", false, "exit 1 when an enabled service is down or Tailscale state is unavailable")
 	if code, done := parseFlags(set, args); done {
+		return code
+	}
+	if code, done := noPositional(set, a); done {
 		return code
 	}
 	cfg, err := common.load(a, false)
@@ -336,7 +391,7 @@ func (a App) cmdStatus(args []string) int {
 		return a.fail(err)
 	}
 	ctx := context.Background()
-	report := statusReport{Config: cfg.Path}
+	report := statusReport{Config: cfg.Path, OK: true}
 	for _, service := range []string{"calibre", "kavita"} {
 		if !cfg.ServiceEnabled(service) {
 			continue
@@ -347,24 +402,37 @@ func (a App) cmdStatus(args []string) int {
 		if service == "kavita" {
 			path = "/api/health"
 		}
-		resp, err := a.HTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, path))
-		if err == nil {
-			status.Reachable = true
-			status.Status = resp.Status
-			resp.Body.Close()
-		} else {
-			status.Status = err.Error()
+		detail, reachable := probeHealth(a.HTTPClient, fmt.Sprintf("http://127.0.0.1:%d%s", port, path))
+		status.Reachable = reachable
+		status.Status = detail
+		if !reachable {
+			report.OK = false
 		}
 		report.Services = append(report.Services, status)
 	}
 	if cfg.Tailnet.Enable {
-		if summary, err := tailnet.ReadStatus(ctx, a.Runner, a.Tailscale); err == nil {
+		summary, readErr := tailnet.ReadStatus(ctx, a.Runner, a.Tailscale)
+		if readErr != nil {
+			report.TailnetError = readErr.Error()
+			report.OK = false
+		} else {
 			report.Tailnet = &summary
-			if endpoints, _, err := a.tailnetEndpoints(ctx, cfg); err == nil {
+			if endpoints, _, endpointErr := a.tailnetEndpoints(ctx, cfg); endpointErr == nil {
 				for _, endpoint := range endpoints {
 					report.URLs = append(report.URLs, doctor.URL{Service: endpoint.Service, URL: endpoint.URL()})
 				}
+			} else if report.TailnetError == "" {
+				report.TailnetError = endpointErr.Error()
+				report.OK = false
 			}
+		}
+	} else {
+		for _, service := range []string{"calibre", "kavita"} {
+			if !cfg.ServiceEnabled(service) {
+				continue
+			}
+			port, _ := cfg.UpstreamPort(service)
+			report.URLs = append(report.URLs, doctor.URL{Service: service, URL: fmt.Sprintf("http://127.0.0.1:%d", port)})
 		}
 	}
 	if latest, err := backup.Latest(cfg.Resolved.BackupDir); err == nil {
@@ -384,6 +452,9 @@ func (a App) cmdStatus(args []string) int {
 			return a.fail(err)
 		}
 		fmt.Fprint(a.Stdout, string(data))
+		if *strict && !report.OK {
+			return 1
+		}
 		return 0
 	}
 
@@ -398,6 +469,9 @@ func (a App) cmdStatus(args []string) int {
 	if report.Tailnet != nil {
 		a.out("tailnet: %s %s", report.Tailnet.BackendState, report.Tailnet.DNSName)
 	}
+	if report.TailnetError != "" {
+		a.out("tailnet error: %s", report.TailnetError)
+	}
 	for _, url := range report.URLs {
 		a.out("url: %s %s", url.Service, url.URL)
 	}
@@ -407,14 +481,24 @@ func (a App) cmdStatus(args []string) int {
 	if report.Runtime != "" {
 		a.out("runtime: %s; %s", report.Runtime, report.ComposeVersion)
 	}
+	if !report.OK {
+		a.out("status: degraded")
+		if *strict {
+			return 1
+		}
+	}
 	return 0
 }
 
 func (a App) cmdLogs(args []string) int {
 	set, common := a.newFlagSet("logs")
 	follow := set.Bool("f", false, "follow logs")
-	if code, done := parseFlags(set, reorderFlags(args, nil)); done {
+	if code, done := parseFlags(set, reorderFlags(set, args)); done {
 		return code
+	}
+	if set.NArg() > 1 {
+		a.errOut("usage: celine logs [service] [-f]")
+		return 2
 	}
 	cfg, err := common.load(a, false)
 	if err != nil {

@@ -21,7 +21,7 @@ let
       throw "services.celine.mediaRoot must be set when celine.toml media_root is relative";
 
   # The token key comes either from a user-supplied file or from SecretSpec.
-  materializeToken = cfg.secretspec.enable && cfg.kavitaTokenKeyFile == null;
+  materializeToken = c.kavita.enable && cfg.secretspec.enable && cfg.kavitaTokenKeyFile == null;
 
   tokenPath =
     if cfg.kavitaTokenKeyFile != null then
@@ -30,8 +30,8 @@ let
       "${cfg.stateDir}/secrets/kavita-token";
 
   secretArgs =
-    " --profile ${cfg.secretspec.profile}"
-    + lib.optionalString (cfg.secretspec.provider != null) " --provider ${cfg.secretspec.provider}";
+    " --profile ${shellQuote cfg.secretspec.profile}"
+    + lib.optionalString (cfg.secretspec.provider != null) " --provider ${shellQuote cfg.secretspec.provider}";
 
   secretEnv =
     lib.optionalAttrs (cfg.secretspec.sopsAgeKeyFile != null) {
@@ -42,6 +42,10 @@ let
     };
 
   secretWantsAfter = lib.optionals materializeToken [ "celine-secrets.service" ];
+
+  # Quote user-controlled paths and values that are interpolated into shell
+  # scripts inside the generated units.
+  shellQuote = value: lib.escapeShellArg value;
 in
 {
   options.services.celine = {
@@ -94,8 +98,9 @@ in
     backup = {
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = true;
-        description = "Enable the scheduled Celine backup timer.";
+        default = c.backup.enable;
+        defaultText = lib.literalExpression "celine.toml [backup].enable";
+        description = "Enable the scheduled Celine backup timer; defaults to [backup].enable.";
       };
 
       dir = lib.mkOption {
@@ -175,8 +180,20 @@ in
       {
         assertions = [
           {
-            assertion = cfg.secretspec.enable || cfg.kavitaTokenKeyFile != null;
+            assertion = !c.kavita.enable || cfg.secretspec.enable || cfg.kavitaTokenKeyFile != null;
             message = "services.celine.kavitaTokenKeyFile must be set when services.celine.secretspec.enable is false";
+          }
+          {
+            assertion = !materializeToken || cfg.secretspec.sopsAgeKeyFile != null || cfg.secretspec.sopsAgeSshPrivateKeyFile != null;
+            message = "set services.celine.secretspec.sopsAgeKeyFile (or sopsAgeSshPrivateKeyFile) when materializing the Kavita token through SOPS; the unit runs outside your login session and cannot use an interactive default identity";
+          }
+          {
+            assertion = lib.hasPrefix "/" cfg.stateDir;
+            message = "services.celine.stateDir must be an absolute path";
+          }
+          {
+            assertion = cfg.mediaRoot == null || lib.hasPrefix "/" cfg.mediaRoot;
+            message = "services.celine.mediaRoot must be null or an absolute path";
           }
         ];
 
@@ -269,9 +286,10 @@ in
             RemainAfterExit = true;
             UMask = "0077";
           };
+          unitConfig.RequiresMountsFor = [ cfg.stateDir ];
           script = ''
-            install -d -m 0700 ${cfg.stateDir}/secrets
-            ${cfg.package}/bin/celine secrets materialize --config ${cfg.configFile} --secretspec ${cfg.secretspec.manifest} --name KAVITA_TOKEN_KEY --out ${tokenPath}${secretArgs}
+            install -d -m 0700 ${shellQuote (cfg.stateDir + "/secrets")}
+            ${cfg.package}/bin/celine secrets materialize --config ${cfg.configFile} --secretspec ${cfg.secretspec.manifest} --name KAVITA_TOKEN_KEY --out ${shellQuote tokenPath}${secretArgs}
           '';
         };
       })
@@ -298,6 +316,10 @@ in
             Restart = "on-failure";
             RestartSec = "30s";
           };
+          unitConfig = {
+            StartLimitIntervalSec = 300;
+            StartLimitBurst = 10;
+          };
           script = "${cfg.package}/bin/celine tailnet apply --config ${cfg.configFile}";
         };
       })
@@ -306,13 +328,14 @@ in
         systemd.services.celine-backup = {
           description = "Back up Celine state";
           serviceConfig.Type = "oneshot";
+          unitConfig.RequiresMountsFor = [ cfg.stateDir cfg.backup.dir ];
           path = [
             cfg.package
             pkgs.sqlite
             pkgs.sops
             pkgs.secretspec
           ];
-          script = "${cfg.package}/bin/celine backup --config ${cfg.configFile} --state-dir ${cfg.stateDir} --backup-dir ${cfg.backup.dir} --retention ${toString cfg.backup.retention}";
+          script = "${cfg.package}/bin/celine backup --config ${cfg.configFile} --state-dir ${shellQuote cfg.stateDir} --backup-dir ${shellQuote cfg.backup.dir} --retention ${toString cfg.backup.retention}";
         };
 
         systemd.timers.celine-backup = {

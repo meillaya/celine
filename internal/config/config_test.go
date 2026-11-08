@@ -190,3 +190,74 @@ func TestSetStateDirUpdatesDerivedPaths(t *testing.T) {
 		t.Fatalf("calibre config dir = %q", cfg.Resolved.CalibreConfigDir)
 	}
 }
+
+func TestRejectsDuplicateServicePorts(t *testing.T) {
+	manifest := strings.Replace(validConfig, "port = 5000", "port = 8080", 1)
+	root := writeFixture(t, manifest)
+	cfg, err := Load(filepath.Join(root, "celine.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.Validate(ValidateOptions{CheckFilesystem: false})
+	if err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("expected duplicate-port error, got %v", err)
+	}
+}
+
+func TestRejectsBadLibraryMount(t *testing.T) {
+	for _, mount := range []string{"/", "/data/"} {
+		manifest := strings.Replace(validConfig, "port = 5000\n", "port = 5000\nlibrary_mount = \""+mount+"\"\n", 1)
+		root := writeFixture(t, manifest)
+		cfg, err := Load(filepath.Join(root, "celine.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = cfg.Validate(ValidateOptions{CheckFilesystem: false})
+		if err == nil || !strings.Contains(err.Error(), "library_mount") {
+			t.Fatalf("expected library_mount error for %q, got %v", mount, err)
+		}
+	}
+}
+
+func TestRejectsMissingBackupDir(t *testing.T) {
+	manifest := strings.Replace(validConfig, `backup_dir = "backups"`, `backup_dir = ""`, 1)
+	root := writeFixture(t, manifest)
+	cfg, err := Load(filepath.Join(root, "celine.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.Validate(ValidateOptions{CheckFilesystem: false})
+	if err == nil || !strings.Contains(err.Error(), "backup_dir") {
+		t.Fatalf("expected backup_dir error, got %v", err)
+	}
+}
+
+func TestRejectsZeroRetentionWhenBackupDisabled(t *testing.T) {
+	manifest := strings.Replace(validConfig, "retention = 10", "retention = 0", 1)
+	manifest = strings.Replace(manifest, "enable = true\nretention", "enable = false\nretention", 1)
+	root := writeFixture(t, manifest)
+	cfg, err := Load(filepath.Join(root, "celine.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.Validate(ValidateOptions{CheckFilesystem: false})
+	if err == nil || !strings.Contains(err.Error(), "backup.retention") {
+		t.Fatalf("expected retention error, got %v", err)
+	}
+}
+
+func TestCalibreOnlyDoesNotRequireSecretspec(t *testing.T) {
+	manifest := strings.Replace(validConfig, "enable = true\nimage = \"example/kavita:1\"", "enable = false\nimage = \"example/kavita:1\"", 1)
+	manifest = strings.Replace(manifest, "[[tailnet.serve]]\nservice = \"kavita\"\nhttps_port = 443\n\n", "", 1)
+	root := writeFixture(t, manifest)
+	if err := os.Remove(filepath.Join(root, "secretspec.toml")); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(filepath.Join(root, "celine.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(ValidateOptions{CheckFilesystem: false}); err != nil {
+		t.Fatalf("Calibre-only configuration rejected: %v", err)
+	}
+}

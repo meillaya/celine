@@ -23,7 +23,7 @@ Rules and orientation for agents changing the Celine repository. The user-facing
 | `devenv.nix`, `devenv.yaml`, `.envrc` | Development shell and scripts. |
 | `tests/nixos-test.nix` | Evaluation-only NixOS fixture. |
 | `scripts/install-boot.sh` | Renders and installs the systemd boot units on a Podman host. Run as the operator; it calls sudo. |
-| `.github/workflows/ci.yml` | CI: `go vet`, `go test`, `go build`, boot script dry run. |
+| `.github/workflows/ci.yml` | CI: `gofmt`, `go vet`, `go test -race`, `go build`, `shellcheck`, render drift, `systemd-analyze verify`, boot script dry run. |
 | `celine.toml`, `secretspec.toml`, `.sops.yaml` | Deployment declaration, secret declarations, SOPS recipients. |
 | `docs/` | Architecture, configuration, operations, migration reference. |
 | `data/`, `state/`, `backups/`, `config/`, `config.backup/`, `secrets/` | Runtime and legacy data. Ignored by Git. |
@@ -41,9 +41,11 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gopath/pkg/mod GOCACHE=$PWD/.cache/g
 Run these checks before you hand off a change:
 
 ```bash
+gofmt -l cmd internal          # must print nothing
 go vet ./...
-go test ./...                 # backup tests use sqlite3; they skip when it is missing
+go test -race -count=1 ./...   # backup/migrate tests need sqlite3; install it rather than skipping
 go build ./cmd/celine
+shellcheck scripts/*.sh
 ```
 
 For render changes or `celine.toml` edits, run the drift check:
@@ -66,14 +68,18 @@ nix eval .#nixosConfigurations.celine-test.config.system.build.toplevel.drvPath
 For systemd unit or boot-script changes:
 
 ```bash
-go run ./cmd/celine systemd render
+go build -o build/celine ./cmd/celine
+./build/celine systemd render
 systemd-analyze verify build/systemd/*.service build/systemd/*.timer
 ./scripts/install-boot.sh --dry-run
 ```
 
+`celine systemd render` refuses a temporary `go run` binary because the unit
+would embed a deleted path; use the built binary or pass `--celine PATH`.
+
 Installing units requires root and is the user's task. The agent environment has no root and no user DBus. The NixOS module installs its own boot units through `celine.target`; the script is for Podman hosts.
 
-Keep the documentation set in step with code changes. A new command, flag, configuration key, or behavior change updates [README.md](README.md) plus the relevant file under `docs/`. CI runs the Go checks only; run the Nix checks locally when the flake, module, or package changes.
+Keep the documentation set in step with code changes. A new command, flag, configuration key, or behavior change updates [README.md](README.md) plus the relevant file under `docs/`. CI runs the Go checks, shellcheck, render drift, and systemd verification; run the Nix checks locally when the flake, module, or package changes.
 
 ## Data directories
 
@@ -95,7 +101,8 @@ Never edit, move, or delete these; they hold user data and rollback sources:
 - The only secret artifact tracked by Git is `secrets/celine.enc.yaml`, encrypted with SOPS. Plaintext `.env` files, `*.plain.*`, `*.dec.*`, and `*.tmp` files under `secrets/` are ignored; never add them.
 - Resolve values through SecretSpec and SOPS. Use `celine secrets materialize --name <name> --out <path>` for consumers, and keep materialized files at mode 0600.
 - Do not print `TokenKey` or `KAVITA_TOKEN_KEY`, do not `cat` decrypted store content, and do not echo the `KAVITA_TOKEN_KEY` environment override.
-- Age private keys stay on hosts. Do not copy them into the repository, and do not add or remove recipients without the owner's approval.
+- Age private keys stay on hosts. Do not copy them into the repository, and do not add or remove recipients without the owner's approval. The identity file must be mode 0600; `celine doctor` fails when it is group/world readable.
+- New Celine backups redact `TokenKey` and known nested secret values, but archives are not encrypted. Treat `backups/` as sensitive state. Legacy `config/`, `config.backup/`, and old `kavita_config_*.tar.gz` archives still contain the legacy signing key in plaintext; do not copy them or make them group/world readable.
 - If a key leaks, rotate it. A new Kavita signing key invalidates sessions; SOPS recipients are updated with `sops updatekeys secrets/celine.enc.yaml`.
 
 ## Runtime safety
@@ -103,19 +110,19 @@ Never edit, move, or delete these; they hold user data and rollback sources:
 These commands change the live deployment or its data, so confirm with the Lead before running them:
 
 ```text
-celine up [--build] [--no-tailnet]
+celine up [--build] [--pull] [--no-tailnet]
 celine down
 celine tailnet apply
 celine tailnet down
 celine backup
 celine restore <archive> --yes
-celine migrate --yes
+celine migrate --yes [--stop-services]
 celine systemd install
-scripts/install-boot.sh
+scripts/install-boot.sh [--enable-linger] [--enable-podman]
 scripts/install-boot.sh --uninstall
 celine secrets materialize
 ```
 
-Read-only commands are safe for diagnosis: `celine validate`, `celine render --check`, `celine status`, `celine logs`, `celine doctor`, `celine tailnet status`, `celine backup --dry-run`, and `celine restore <archive> --dry-run`.
+Read-only commands are safe for diagnosis: `celine validate`, `celine render --check`, `celine status`, `celine status --strict`, `celine logs`, `celine doctor`, `celine doctor --expect-running`, `celine tailnet status`, `celine backup --dry-run`, and `celine restore <archive> --dry-run`.
 
 Run `celine up`, `celine down`, and tailnet commands only with `DOCKER_HOST` pointing at the rootless Podman socket. Do not change pinned image versions, host ports, or storage paths as part of unrelated work.
