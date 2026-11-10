@@ -286,7 +286,7 @@ When the systemd units change, re-render and reinstall them. See the next sectio
 
 | Unit | Purpose |
 | --- | --- |
-| `celine.service` | System oneshot service with `User=<invoking user>` that runs `celine up --config <path>` at boot and `celine down --config <path>` on stop. It waits for the network, `tailscaled`, the user manager (`user@<uid>.service`), and the Podman socket, requires the media/state/backup mounts, and restarts on failure after 20 seconds. |
+| `celine.service` | System oneshot service with `User=<invoking user>` that runs `celine up --config <path>` at boot and `celine down --config <path>` on stop. It waits for the network, `tailscaled`, the user manager (`user@<uid>.service`), the Podman socket, and up to 20 minutes for the binary/media root; requires the media/state/backup mounts; and restarts on failure after 20 seconds. |
 | `celine-backup.service` | Oneshot service that runs `celine backup --config <path>`. |
 | `celine-backup.timer` | Timer with `OnCalendar` from `backup.on_calendar` and `Persistent=true`. |
 
@@ -328,7 +328,7 @@ On NixOS, do not use the script. The module defines `celine.target`, which wants
 ## Disk and mount
 
 - The external drive is `/dev/sda1`, ext4, mounted at the repository path. `celine doctor` reports mount source and filesystem for the media root.
-- The generated `celine.service` and `celine-backup.service` carry `RequiresMountsFor` for the media, state, and backup directories. A boot without the drive fails the unit instead of starting containers against an empty directory.
+- `RequiresMountsFor` only helps when the drive has a boot-time mount unit. If the desktop auto-mounts it after login, `celine.service` can start first. The generated units therefore also wait up to 20 minutes for the binary and media root, and `scripts/install-boot.sh` warns when the repository mount is absent from `/etc/fstab`. Configure the drive at boot for unattended operation. The units carry `RequiresMountsFor` for the media, state, and backup directories as well.
 - `celine doctor` fails below 512 MiB free on the media root or backup directory and warns below 5 GiB. Run `df -h` on the repository path when the check warns.
 - Images live in the rootless Podman store under the user's home, not on the media drive. Media and archives grow on the drive; archives stay small relative to media.
 
@@ -356,6 +356,7 @@ On NixOS, do not use the script. The module defines `celine.target`, which wants
 | Kavita fails after an image upgrade | Database migration error | See [migration.md](migration.md); restore the latest archive or re-import `config/` |
 | Calibre pages fail with `OSError` after a mount change | Media mounted read-only, which breaks the case-sensitivity probe | Restore the read-write mount from the rendered Compose |
 | `celine.service` fails at boot | Media mount missing, lingering disabled, or `DOCKER_HOST` absent from the unit | Mount the drive; enable linger; re-render the units with `DOCKER_HOST` exported; reinstall |
+| `celine.service` failed with `203/EXEC` and URLs return 502 after reboot | The external drive mounted after the unit started; before the path wait this exhausted the start limit | Run `celine up` now; configure the drive to mount at boot; rerun `scripts/install-boot.sh` (the new unit waits up to 20 minutes for the drive) and reset the failed unit with `sudo systemctl reset-failed celine.service` |
 | Ports owned by another user | Rootless podman user or rootful daemon | Check `docker ps` against the running user; stop the conflicting service |
 
 ## Validation status
@@ -364,4 +365,6 @@ Verified live on this host on 2026-11-07: `celine up --build`, `celine status` a
 
 On 2026-11-08 the remediation was exercised live: `celine up` recreated the containers with the new Compose stop grace periods and reset managed state modes; `celine backup` produced a verified archive with `TokenKey` and `OpenIdConnectSettings.Secret` redacted and no SQLite sidecars; `celine restore --dry-run` verified that archive; `celine status --strict` exited 0; `celine doctor` reported 28 ok, 2 warn, 0 fail (the warnings are the not-yet-installed boot units and disabled lingering); the age identity and legacy plaintext copies were restricted to mode 0600/0700; `celine render --check`, `systemd-analyze verify`, `shellcheck`, `go test -race`, `nix flake check --no-build`, and `nix build .#default` passed.
 
-Not run in this environment: a live restore over running state (destructive), `scripts/install-boot.sh` installation and `loginctl enable-linger` (require root; left to the operator), a NixOS host deployment, and the rootful runtime path. The timer is not installed until the operator runs the boot script, so doctor will keep warning about boot persistence until then.
+Not run in this environment: a live restore over running state (destructive), `scripts/install-boot.sh` installation and `loginctl enable-linger` (require root; left to the operator), a NixOS host deployment, and the rootful runtime path.
+
+On 2026-11-10 a real reboot exposed a remaining boot-order problem: the external drive mounted at 13:32, while `celine.service` started at 13:25, failed to execute `build/celine`, and hit its start limit. The stack was brought up manually; the generated units now wait up to 20 minutes for the binary and media root, `TimeoutStartSec` is 1800, the install script clears `start-limit-hit`, and it warns when the repository mount is absent from `/etc/fstab`. Re-run the install script to put the fixed unit in place; configuring the drive to mount at boot is still recommended for unattended operation.

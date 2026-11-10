@@ -72,15 +72,22 @@ func SystemdUnits(opts SystemdOptions) (map[string]string, error) {
 		after = append(after, fmt.Sprintf("user@%d.service", opts.UID))
 	}
 	mounts := requiredMounts(opts)
-	startPre := ""
+	var startPre []string
 	if opts.Rootless && strings.HasPrefix(opts.DockerHost, "unix://") {
 		socket := strings.TrimPrefix(opts.DockerHost, "unix://")
 		if socket != "" {
 			// The socket is provided by the user manager. After a cold boot it
 			// can appear slightly after the system unit starts, so wait instead
 			// of failing the whole boot.
-			startPre = "ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S \"$1\" ] && exit 0; sleep 2; done; exit 1' sh " + unitValue(socket)
+			startPre = append(startPre, "ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S \"$1\" ] && exit 0; sleep 2; done; exit 1' sh "+unitValue(socket))
 		}
+	}
+	if wait := deploymentWaitLine(opts.CelineBin, opts.MediaRoot); wait != "" {
+		// The binary and media live on the external drive. It can be mounted by
+		// udisks after the user logs in, which is later than the system service
+		// starts. Wait for the deployment paths instead of failing the boot and
+		// hitting the start limit before the drive appears.
+		startPre = append(startPre, wait)
 	}
 
 	unit := []string{
@@ -104,15 +111,13 @@ func SystemdUnits(opts SystemdOptions) (map[string]string, error) {
 		"WorkingDirectory="+unitValue(opts.Home),
 		strings.Join(environment, "\n"),
 	)
-	if startPre != "" {
-		unit = append(unit, startPre)
-	}
+	unit = append(unit, startPre...)
 	unit = append(unit,
 		fmt.Sprintf("ExecStart=%s up --config %s", unitValue(opts.CelineBin), unitValue(opts.ConfigPath)),
 		fmt.Sprintf("ExecStop=%s down --config %s", unitValue(opts.CelineBin), unitValue(opts.ConfigPath)),
 		"Restart=on-failure",
 		"RestartSec=20",
-		"TimeoutStartSec=600",
+		"TimeoutStartSec=1800",
 		"TimeoutStopSec=120",
 		"",
 		"[Install]",
@@ -131,6 +136,10 @@ func SystemdUnits(opts SystemdOptions) (map[string]string, error) {
 	if mounts != "" {
 		backupUnit = append(backupUnit, "RequiresMountsFor="+mounts)
 	}
+	backupPre := []string{}
+	if wait := deploymentWaitLine(opts.CelineBin, opts.MediaRoot); wait != "" {
+		backupPre = append(backupPre, wait)
+	}
 	backupUnit = append(backupUnit,
 		"",
 		"[Service]",
@@ -139,6 +148,9 @@ func SystemdUnits(opts SystemdOptions) (map[string]string, error) {
 		"Group="+unitValue(opts.Group),
 		"WorkingDirectory="+unitValue(opts.Home),
 		strings.Join(environment, "\n"),
+	)
+	backupUnit = append(backupUnit, backupPre...)
+	backupUnit = append(backupUnit,
 		fmt.Sprintf("ExecStart=%s backup --config %s", unitValue(opts.CelineBin), unitValue(opts.ConfigPath)),
 		"Nice=10",
 		"TimeoutStartSec=1800",
@@ -173,6 +185,33 @@ func requiredMounts(opts SystemdOptions) string {
 		mounts = append(mounts, unitValue(path))
 	}
 	return strings.Join(mounts, " ")
+}
+
+// deploymentWaitLine waits for the binary and media root, which may live on
+// an external drive mounted after the system service starts. The paths are
+// passed as positional arguments so no nested shell quoting is needed.
+func deploymentWaitLine(binary, mediaRoot string) string {
+	var checks, args []string
+	index := 1
+	if binary != "" {
+		checks = append(checks, fmt.Sprintf(`[ -x "$%d" ]`, index))
+		args = append(args, unitValue(binary))
+		index++
+	}
+	if mediaRoot != "" {
+		checks = append(checks, fmt.Sprintf(`[ -d "$%d" ]`, index))
+		args = append(args, unitValue(mediaRoot))
+	}
+	if len(checks) == 0 {
+		return ""
+	}
+	script := fmt.Sprintf("for i in $(seq 1 120); do %s && exit 0; sleep 10; done; exit 1", strings.Join(checks, " && "))
+	return "ExecStartPre=/bin/sh -c " + shellQuote(script) + " sh " + strings.Join(args, " ")
+}
+
+// shellQuote quotes a value for a POSIX shell single-quoted string.
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 // unitValue quotes a systemd unit value when it contains whitespace or

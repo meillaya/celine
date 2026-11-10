@@ -81,6 +81,8 @@ Run these steps from the repository root with the media drive mounted and `tails
    scripts/install-boot.sh --enable-linger --enable-podman
    ```
 
+   The stack lives on the external drive. Configure that drive to mount at boot (an `/etc/fstab` or systemd mount entry); the generated unit waits up to 20 minutes for the drive, but unattended boot and backups should not depend on logging in first.
+
 This host is already deployed: `state/`, `secrets/celine.enc.yaml`, and `backups/` exist. Do not rerun `celine migrate` without `--force`, and run `celine doctor --strict --expect-running` after boot changes to see whether units, lingering, secret modes, and the backup timer are actually healthy. Run `celine up` to converge configuration changes.
 
 ## Daily commands
@@ -175,6 +177,7 @@ The Kavita signing key (`TokenKey`) and known nested secret keys (for example `O
 | Doctor reports `backup timer` | Run `scripts/install-boot.sh`, then `systemctl list-timers celine-backup.timer` |
 | Doctor reports `backup integrity` | Keep the old archive, run `celine backup`, and verify the new one with `celine restore --dry-run` |
 | Tailscale Serve is not applied | Run `celine tailnet apply`; check `tailscale status` and HTTPS certificates for the tailnet |
+| Tailnet URLs return 502 after a reboot | `celine.service` failed before the external drive mounted | Run `celine up` now; add the drive to `/etc/fstab`, rerun `scripts/install-boot.sh`, and clear the failed unit with `sudo systemctl reset-failed celine.service` |
 | Secrets do not resolve | Run `secretspec --file secretspec.toml check`; unlock the age identity |
 | A service is not healthy | Run `celine logs <service>`; check the port in `celine.toml` |
 | Media root is not a separate mount | Mount the external drive; the generated systemd unit uses `RequiresMountsFor` |

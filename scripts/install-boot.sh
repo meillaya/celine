@@ -191,6 +191,19 @@ if [ "$DRY_RUN" -eq 0 ]; then
   sudo -v
 fi
 
+check_boot_mount() {
+  local target
+  target=$(findmnt -T "$ROOT" -n -o TARGET 2>/dev/null | head -n1 || true)
+  if [ -n "$target" ] && [ "$target" != "/" ]; then
+    if grep -qsF -- "$target" /etc/fstab; then
+      printf '  mount: %s is listed in /etc/fstab\n' "$target"
+    else
+      warn "repository is on mount $target, which is not in /etc/fstab; it may appear after celine.service starts"
+      printf '  the unit now waits up to 20 minutes for the deployment paths; add an fstab/systemd mount entry for unattended boot\n'
+    fi
+  fi
+}
+
 check_prereqs() {
   local operator
   operator=$(id -un)
@@ -233,6 +246,8 @@ check_prereqs() {
 
 printf '\nChecking rootless prerequisites\n'
 check_prereqs
+printf '\nChecking the repository mount\n'
+check_boot_mount
 
 if [ ! -f "$UNIT_DIR/celine-backup.timer" ]; then
   # backup.enable is false: remove units left by an earlier install instead of
@@ -247,6 +262,9 @@ for unit in "${UNIT_FILES[@]}"; do
   run sudo install -m644 "$UNIT_DIR/$unit" "$SYSTEM_DIR/$unit"
 done
 run sudo systemctl daemon-reload
+# A failed boot can leave the unit in start-limit-hit. Clear that before
+# enabling/starting so this run actually retries.
+run sudo systemctl reset-failed celine.service || true
 run sudo systemctl enable --now "${ENABLE_UNITS[@]}"
 
 if [ "$DRY_RUN" -eq 1 ]; then

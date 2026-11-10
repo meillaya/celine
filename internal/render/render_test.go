@@ -183,7 +183,9 @@ func TestSystemdUnits(t *testing.T) {
 		"Environment=PATH=/home/mei/.nix-profile/bin:/usr/bin:/bin",
 		"Environment=XDG_RUNTIME_DIR=/run/user/1000",
 		"Environment=SOPS_AGE_KEY_FILE=/home/mei/.config/sops/age/keys.txt",
+		"ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do [ -x \"$1\" ] && [ -d \"$2\" ] && exit 0; sleep 10; done; exit 1' sh /nix/store/celine/bin/celine /media",
 		"ExecStart=/nix/store/celine/bin/celine up --config /repo/celine.toml",
+		"TimeoutStartSec=1800",
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(service, want) {
@@ -196,8 +198,12 @@ func TestSystemdUnits(t *testing.T) {
 	if !strings.Contains(units["celine-backup.timer"], "OnCalendar=daily") {
 		t.Errorf("timer missing calendar:\n%s", units["celine-backup.timer"])
 	}
-	if !strings.Contains(units["celine-backup.service"], "RequiresMountsFor=/media /repo/state /repo/backups") {
-		t.Errorf("backup service missing mounts:\n%s", units["celine-backup.service"])
+	backup := units["celine-backup.service"]
+	if !strings.Contains(backup, "RequiresMountsFor=/media /repo/state /repo/backups") {
+		t.Errorf("backup service missing mounts:\n%s", backup)
+	}
+	if !strings.Contains(backup, "[ -x \"$1\" ]") || !strings.Contains(backup, "sh /nix/store/celine/bin/celine /media") {
+		t.Errorf("backup service does not wait for the deployment paths:\n%s", backup)
 	}
 }
 
